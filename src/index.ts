@@ -235,6 +235,52 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
               }
             }
 
+            // ── 429: rate limited ──
+            // If retry-after is long, return a non-429 response so OpenCode
+            // doesn't loop forever with "Retrying in 25207s".
+            if (response.status === 429) {
+              const retryAfter = response.headers.get("retry-after");
+              const retryMs = retryAfter
+                ? parseInt(retryAfter, 10) * 1000
+                : 60_000;
+
+              console.log(
+                `[dark-auth] Rate limited (${Math.round(retryMs / 1000)}s cooldown)`,
+              );
+
+              // Track rate limit + try switching accounts
+              const nextAccount = handleRateLimit(account.id, retryMs);
+
+              // Try next account if available
+              if (nextAccount) {
+                const nextCreds = await getCachedCredentials(nextAccount.id);
+                if (nextCreds) {
+                  console.log("[dark-auth] Switching to next account");
+                  headers.set("authorization", `Bearer ${nextCreds.accessToken}`);
+                  return fetch(input, { ...init, headers });
+                }
+              }
+
+              // No other accounts — return error that won't trigger retry loop
+              const mins = Math.ceil(retryMs / 60000);
+              return new Response(
+                JSON.stringify({
+                  type: "error",
+                  error: {
+                    type: "rate_limit_error",
+                    message: `Rate limited. Resets in ~${mins}min.`,
+                  },
+                }),
+                {
+                  status: 429,
+                  headers: {
+                    "content-type": "application/json",
+                    "x-should-retry": "false",
+                  },
+                },
+              );
+            }
+
             return response;
           },
         };
