@@ -30,6 +30,9 @@ import {
 const PROACTIVE_REFRESH_INTERVAL = 5 * 60 * 1000;
 const PROACTIVE_REFRESH_THRESHOLD = 60 * 60 * 1000;
 
+// Stable per-process session ID, matching Claude Code's X-Claude-Code-Session-Id
+const sessionId = randomUUID();
+
 export default async function darkAuthPlugin({ client }: { client: any }) {
   console.log("[dark-auth] Initializing plugin");
 
@@ -225,6 +228,7 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
             headers.set("x-app", "cli");
             headers.set("user-agent", `claude-cli/2.1.159 (external, sdk-cli)`);
             headers.set("x-client-request-id", randomUUID());
+            headers.set("X-Claude-Code-Session-Id", sessionId);
             
             // Stainless headers (matching fix plugin)
             const stainlessHeaders = {
