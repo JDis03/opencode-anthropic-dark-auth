@@ -194,7 +194,7 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
             headers.delete("x-api-key");
             headers.set("authorization", `Bearer ${credentials.accessToken}`);
             headers.set("anthropic-version", "2023-06-01");
-            headers.set("anthropic-beta", "oauth-2025-04-20");
+            headers.set("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,files-api-2025-04-14,prompt-caching-scope-2026-01-05,extended-cache-ttl-2025-04-11");
             headers.set("x-app", "cli");
             headers.set("user-agent", "claude-cli/2.1.159 (external, cli)");
             headers.set("x-stainless-arch", process.arch === "arm64" ? "arm64" : "x64");
