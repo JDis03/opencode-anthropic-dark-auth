@@ -243,6 +243,13 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
 
             // Make the request
             let response = await fetch(requestUrl, { ...init, headers });
+            
+            // Log non-200 responses for debugging
+            if (response.status !== 200) {
+              const cloned = response.clone();
+              const body = await cloned.text().catch(() => "");
+              console.log(`[dark-auth] Response ${response.status}:`, body.substring(0, 500));
+            }
 
             // ── 401 handler (our fix) ──
             // Token invalidated (e.g. running `claude` in terminal revoked
