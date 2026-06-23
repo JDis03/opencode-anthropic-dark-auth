@@ -68,4 +68,4 @@ This plugin uses Claude Code's OAuth credentials to authenticate with Anthropic'
 
 ## License
 
-MIT © DarkRed
+MIT © Dark
