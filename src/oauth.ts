@@ -51,44 +51,62 @@ export function buildAuthorizeURL(state: OAuthState): string {
 
 /**
  * Exchange authorization code for tokens
- * callbackValue is the full callback URL or code#state string from OpenCode
+ * callbackValue is the full callback value from OpenCode (contains code=XX#state=YY)
  */
 export async function exchangeCode(
   callbackValue: string,
   verifier: string
 ): Promise<OAuthCredentials | null> {
-  // Parse Anthropic callback: ?code=CODE#state=STATE
-  const parts = callbackValue.split("#");
-  const codePart = parts[0] || "";
-  const state = parts[1] || "";
+  // Parse Anthropic callback: ?code=CODE or code=CODE#state=STATE
+  let code: string;
+  let state: string;
 
-  // Extract code from URL or string
-  let code = codePart;
+  // Try parsing as URL first
   try {
-    const url = new URL(codePart);
-    code = url.searchParams.get("code") || codePart;
+    const url = new URL(callbackValue);
+    code = url.searchParams.get("code") || "";
+    state = url.searchParams.get("state") || "";
   } catch {
-    // Not a URL, use as-is
+    // Try splitting by # (code#state format)
+    const parts = callbackValue.split("#");
+    code = parts[0] || "";
+    state = parts[1] || "";
+    
+    // If code starts with code=, extract it
+    if (code.includes("code=")) {
+      const match = code.match(/code=([^&]*)/);
+      code = match ? match[1] : code;
+    }
   }
+
+  if (!code) {
+    console.error("[dark-auth] No authorization code found in callback");
+    return null;
+  }
+
+  console.log("[dark-auth] Exchanging code for tokens...");
 
   try {
     const response = await fetch(TOKEN_URL, {
       method: "POST",
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
       },
-      body: new URLSearchParams({
+      body: JSON.stringify({
         grant_type: "authorization_code",
         client_id: CLIENT_ID,
         code,
-        code_verifier: verifier,
-        redirect_uri: REDIRECT_URI,
         state,
-      }).toString(),
+        redirect_uri: REDIRECT_URI,
+        code_verifier: verifier,
+      }),
     });
 
     if (!response.ok) {
-      console.error(`[dark-auth] Token exchange failed: ${response.status}`);
+      const errorBody = await response.text().catch(() => "");
+      console.error(
+        `[dark-auth] Token exchange failed: ${response.status} — ${errorBody.slice(0, 200)}`
+      );
       return null;
     }
 
@@ -98,6 +116,8 @@ export async function exchangeCode(
       expires_in: number;
     };
 
+    console.log("[dark-auth] Token exchange successful");
+    
     return {
       accessToken: data.access_token,
       refreshToken: data.refresh_token,
@@ -119,13 +139,13 @@ export async function refreshToken(
     const response = await fetch(TOKEN_URL, {
       method: "POST",
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
       },
-      body: new URLSearchParams({
+      body: JSON.stringify({
         grant_type: "refresh_token",
         client_id: CLIENT_ID,
         refresh_token: refreshToken,
-      }).toString(),
+      }),
     });
 
     if (!response.ok) {
