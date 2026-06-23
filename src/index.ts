@@ -165,38 +165,9 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
 
         // We have oauth — return custom fetch with our fixes
         return {
-          apiKey: "",
+          apiKey: "oauth",
 
           async fetch(input: string | URL | Request, init?: RequestInit) {
-            // Transform URL: add ?beta=true for /v1/messages endpoint.
-            // Without this, Anthropic routes through standard API (credits)
-            // instead of Claude Code beta pipeline (Pro/Max unlimited).
-            let requestInput: string | URL | Request = input;
-            try {
-              const url = new URL(
-                typeof input === "string"
-                  ? input
-                  : input instanceof URL
-                    ? input.toString()
-                    : (input as Request).url,
-              );
-              const isMessages =
-                url.pathname === "/v1/messages" ||
-                url.pathname === "/messages";
-              if (isMessages && !url.searchParams.has("beta")) {
-                if (!url.pathname.startsWith("/v1/")) {
-                  url.pathname = "/v1" + url.pathname;
-                }
-                url.searchParams.set("beta", "true");
-                requestInput =
-                  input instanceof Request
-                    ? new Request(url.toString(), input)
-                    : url.toString();
-              }
-            } catch {
-              // If URL parsing fails, use input as-is
-            }
-
             const account = getActiveAccount();
 
             if (!account) {
@@ -213,35 +184,14 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
               );
             }
 
-            // Build request with auth header
-            // OAuth tokens use Authorization: Bearer (NOT x-api-key)
-            // Stainless headers match the official Claude Code client fingerprint —
-            // without them Anthropic routes to credits billing, not Pro/Max unlimited.
+            // Only inject the OAuth token — let OpenCode handle everything else.
+            // The built-in Anthropic provider already sets stainless headers,
+            // beta flags, user-agent, etc. We just need to provide the token.
             const headers = new Headers(init?.headers);
-            headers.delete("x-api-key");
-            headers.set("authorization", `Bearer ${credentials.accessToken}`);
-            headers.set("anthropic-version", "2023-06-01");
-            headers.set("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,files-api-2025-04-14,prompt-caching-scope-2026-01-05,extended-cache-ttl-2025-04-11");
-            headers.set("x-app", "cli");
-            headers.set("user-agent", "claude-cli/2.1.159 (external, cli)");
-            headers.set("x-stainless-arch", process.arch === "arm64" ? "arm64" : "x64");
-            headers.set("x-stainless-lang", "js");
-            headers.set("x-stainless-os", process.platform === "darwin" ? "macOS" : process.platform === "win32" ? "Windows" : "Linux");
-            headers.set("x-stainless-package-version", "0.94.0");
-            headers.set("x-stainless-runtime", "node");
-            headers.set("x-stainless-runtime-version", process.version);
-            headers.set("x-stainless-retry-count", "0");
-            headers.set("x-stainless-timeout", "600");
-            headers.set("anthropic-dangerous-direct-browser-access", "true");
+            headers.set("Authorization", `Bearer ${credentials.accessToken}`);
 
             // Make the request
-            if (requestInput !== input) {
-              console.log("[dark-auth] URL transformed:", 
-                typeof requestInput === "string" ? requestInput : 
-                requestInput instanceof Request ? (requestInput as Request).url : 
-                requestInput.toString());
-            }
-            let response = await fetch(requestInput, { ...init, headers });
+            let response = await fetch(input, { ...init, headers });
             if (response.status !== 200) {
               const cloned = response.clone();
               const body = await cloned.text().catch(() => "");
@@ -264,8 +214,8 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                   refreshed.expiresAt,
                 );
                 syncAuthJson(refreshed);
-                headers.set("authorization", `Bearer ${refreshed.accessToken}`);
-                response = await fetch(requestInput, { ...init, headers });
+                headers.set("Authorization", `Bearer ${refreshed.accessToken}`);
+                response = await fetch(input, { ...init, headers });
               } else {
                 throw new Error(
                   "[dark-auth] Token refresh failed after 401. Run login to re-authenticate.",
