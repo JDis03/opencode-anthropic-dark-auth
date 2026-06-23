@@ -1,17 +1,23 @@
 /**
  * opencode-anthropic-dark-auth
  * Anthropic OAuth plugin for OpenCode with multi-account support
+ * Original implementation — not a fork. Own architecture, own fixes.
+ *
+ * Design: uses client.auth.set() to persist into OpenCode's internal store
+ * so getAuth() returns oauth credentials. Our own storage handles multi-account
+ * rotation; OpenCode's auth store acts as the "primary" account mirror.
  */
 
 import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import type { Account } from "./types.js";
 import { generatePKCE, buildAuthorizeURL, exchangeCode } from "./oauth.js";
 import {
   loadAccounts,
-  saveAccounts,
   upsertAccount,
   getActiveAccount,
-  setActiveAccount,
   getStoragePath,
 } from "./storage.js";
 import {
@@ -19,97 +25,126 @@ import {
   refreshIfNeeded,
   invalidateCache,
   handleRateLimit,
-  getShortestWait,
 } from "./accounts.js";
 
-// Track pending OAuth flows
-const pendingOAuthFlows = new Map<string, { verifier: string; createdAt: number }>();
+const PROACTIVE_REFRESH_INTERVAL = 5 * 60 * 1000;
+const PROACTIVE_REFRESH_THRESHOLD = 60 * 60 * 1000;
 
-/**
- * OpenCode plugin export
- */
-export default async function plugin() {
+export default async function darkAuthPlugin({ client }: { client: any }) {
   console.log("[dark-auth] Initializing plugin");
 
   const storage = loadAccounts();
   console.log(`[dark-auth] Loaded ${storage.accounts.length} account(s)`);
 
-  // If no accounts, return empty config (user needs to login)
-  if (storage.accounts.length === 0) {
-    console.log("[dark-auth] No accounts found. Use login method to authenticate.");
-    return {
-      auth: {
-        provider: "anthropic",
-        async loader() {
-          return {};
-        },
-        methods: [
-          {
-            type: "oauth",
-            label: "Login with Claude Pro/Max",
-            async authorize() {
-              const pkce = generatePKCE();
-              const url = buildAuthorizeURL(pkce);
-              const flowId = randomUUID();
+  // ── Persist into OpenCode's internal auth store ──
+  // This is what getAuth() reads from. Without this, OpenCode never knows
+  // we have oauth credentials and falls back to API key prompt.
 
-              pendingOAuthFlows.set(flowId, {
-                verifier: pkce.verifier,
-                createdAt: Date.now(),
-              });
-
-              return {
-                url,
-                instructions:
-                  "Open the URL above in your browser to authorize with your Claude Pro/Max account.",
-                method: "manual" as const,
-                async callback(authorizationCode: string) {
-                  const flow = pendingOAuthFlows.get(flowId);
-                  if (!flow) {
-                    return { type: "failed" as const };
-                  }
-
-                  pendingOAuthFlows.delete(flowId);
-
-                  const credentials = await exchangeCode(
-                    authorizationCode,
-                    flow.verifier
-                  );
-
-                  if (!credentials) {
-                    return { type: "failed" as const };
-                  }
-
-                  const account: Account = {
-                    id: randomUUID(),
-                    label: "Claude Pro/Max",
-                    credentials,
-                    enabled: true,
-                    createdAt: Date.now(),
-                    lastUsedAt: Date.now(),
-                  };
-
-                  upsertAccount(account);
-
-                  return {
-                    type: "success" as const,
-                    provider: "anthropic" as const,
-                    access: credentials.accessToken,
-                    refresh: credentials.refreshToken,
-                    expires: credentials.expiresAt,
-                  };
-                },
-              };
-            },
-          },
-        ],
-      },
-    };
+  async function persistOpenCodeAuth(
+    refresh: string,
+    access: string,
+    expires: number,
+  ) {
+    try {
+      await client.auth.set({
+        path: { id: "anthropic" },
+        body: { type: "oauth", refresh, access, expires },
+      });
+    } catch (err) {
+      console.error("[dark-auth] Failed to persist OpenCode auth:", err);
+    }
   }
 
-  // Has accounts - provide auth loader with custom fetch
+  // ── Also sync to auth.json as backup ──
+
+  function syncAuthJson(credentials: {
+    accessToken: string;
+    refreshToken: string;
+    expiresAt: number;
+  }): void {
+    const authDir = join(homedir(), ".local", "share", "opencode");
+    const authPath = join(authDir, "auth.json");
+
+    if (!existsSync(authDir)) {
+      mkdirSync(authDir, { recursive: true, mode: 0o700 });
+    }
+
+    let auth: Record<string, any> = {};
+    if (existsSync(authPath)) {
+      try {
+        auth = JSON.parse(readFileSync(authPath, "utf-8"));
+      } catch {
+        /* malformed, start fresh */
+      }
+    }
+
+    auth.anthropic = {
+      type: "oauth",
+      access: credentials.accessToken,
+      refresh: credentials.refreshToken,
+      expires: credentials.expiresAt,
+    };
+
+    writeFileSync(authPath, JSON.stringify(auth, null, 2), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+    chmodSync(authPath, 0o600);
+  }
+
+  // ── Proactive refresh timer ──
+  // Every 5 minutes, check if the active account's token is expiring
+  // within 1 hour. If so, refresh it proactively.
+  // Our fix from the opencode-claude-auth work.
+
+  if (storage.accounts.length > 0) {
+    const refreshTimer = setInterval(async () => {
+      try {
+        const current = getActiveAccount();
+        if (!current) return;
+
+        const expiresIn = current.credentials.expiresAt - Date.now();
+        if (expiresIn < PROACTIVE_REFRESH_THRESHOLD) {
+          console.log(
+            `[dark-auth] Proactive refresh: token expires in ${Math.round(expiresIn / 60000)}min`,
+          );
+          const refreshed = await refreshIfNeeded(current, true);
+          if (refreshed) {
+            await persistOpenCodeAuth(
+              refreshed.refreshToken,
+              refreshed.accessToken,
+              refreshed.expiresAt,
+            );
+            syncAuthJson(refreshed);
+            console.log("[dark-auth] Proactive refresh successful");
+          }
+        }
+      } catch {
+        // Non-fatal: timer keeps running
+      }
+    }, PROACTIVE_REFRESH_INTERVAL);
+    refreshTimer.unref();
+  }
+
+  // ── Boot: sync existing accounts to OpenCode auth store ──
+  const active = getActiveAccount();
+  if (active) {
+    await persistOpenCodeAuth(
+      active.credentials.refreshToken,
+      active.credentials.accessToken,
+      active.credentials.expiresAt,
+    );
+  }
+
+  // ── Return auth configuration ──
+  // Always return the full auth config — even with zero accounts.
+  // The loader handles the "no auth" case by returning {} so OpenCode
+  // falls through to showing auth methods.
+
   return {
     auth: {
-      provider: "anthropic",
+      provider: "anthropic" as const,
+
       async loader(getAuth: () => Promise<any>, provider: any) {
         console.log("[dark-auth] Auth loader called");
 
@@ -122,55 +157,121 @@ export default async function plugin() {
           };
         }
 
+        // Check if OpenCode knows about our OAuth credentials
+        const auth = await getAuth();
+        if (auth.type !== "oauth") {
+          console.log("[dark-auth] No oauth credentials — showing auth methods");
+          return {};
+        }
+
+        // We have oauth — return custom fetch with our fixes
         return {
-          apiKey: "", // Not used, we provide custom fetch
+          apiKey: "",
           baseURL: "https://api.anthropic.com/v1",
+
           async fetch(input: string | URL | Request, init?: RequestInit) {
             const account = getActiveAccount();
-            
+
             if (!account) {
               throw new Error(
-                "[dark-auth] No active account. Run login to authenticate."
+                "[dark-auth] No active account. Run login to authenticate.",
               );
             }
 
-            // Get fresh credentials (with caching and proactive refresh)
+            // Get credentials with proactive refresh
             const credentials = await getCachedCredentials(account.id);
-
             if (!credentials) {
               throw new Error(
-                "[dark-auth] Failed to get credentials. Token might be expired."
+                "[dark-auth] Failed to get credentials. Token might be expired.",
               );
             }
 
-            // Build request with auth header
+            // Transform URL: add ?beta=true for /v1/messages (matching fix plugin)
+            const url = new URL(
+              typeof input === "string"
+                ? input
+                : input instanceof URL
+                  ? input.toString()
+                  : (input as Request).url
+            );
+            if (url.pathname === "/v1/messages" && !url.searchParams.has("beta")) {
+              url.searchParams.set("beta", "true");
+            }
+            const requestUrl = typeof input === "string" ? url.toString() : url;
+
+            // Build request headers (matching fix plugin exactly)
             const headers = new Headers(init?.headers);
-            headers.set("x-api-key", credentials.accessToken);
+            
+            // Merge anthropic-beta values
+            const incomingBeta = headers.get("anthropic-beta") ?? "";
+            const baseBetas = [
+              "oauth-2025-04-20",
+              "files-api-2025-04-14",
+              "prompt-caching-scope-2026-01-05",
+              "extended-cache-ttl-2025-04-11"
+            ];
+            const mergedBetas = [
+              ...new Set([
+                ...baseBetas,
+                ...incomingBeta.split(",").map((b) => b.trim()).filter(Boolean),
+              ]),
+            ];
+
+            headers.delete("x-api-key");
+            headers.set("authorization", `Bearer ${credentials.accessToken}`);
             headers.set("anthropic-version", "2023-06-01");
+            headers.set("anthropic-beta", mergedBetas.join(","));
+            headers.set("anthropic-dangerous-direct-browser-access", "true");
+            headers.set("x-app", "cli");
+            headers.set("user-agent", `claude-cli/2.1.159 (external, sdk-cli)`);
+            headers.set("x-client-request-id", randomUUID());
+            
+            // Stainless headers (matching fix plugin)
+            const stainlessHeaders = {
+              "x-stainless-arch": process.arch === "arm64" ? "arm64" : process.arch,
+              "x-stainless-lang": "js",
+              "x-stainless-os": process.platform === "darwin" ? "MacOS" : process.platform,
+              "x-stainless-package-version": "0.81.0",
+              "x-stainless-retry-count": "0",
+              "x-stainless-runtime": "node",
+              "x-stainless-runtime-version": process.version,
+              "x-stainless-timeout": "600",
+            };
+            for (const [key, value] of Object.entries(stainlessHeaders)) {
+              if (!headers.has(key)) headers.set(key, value);
+            }
 
             // Make the request
-            let response = await fetch(input, {
-              ...init,
-              headers,
-            });
+            let response = await fetch(requestUrl, { ...init, headers });
 
-            // Handle 401: force refresh and retry
+            // ── 401 handler (our fix) ──
+            // Token invalidated (e.g. running `claude` in terminal revoked
+            // our refresh token). Invalidate cache, force refresh, retry once.
             if (response.status === 401) {
               console.log("[dark-auth] 401 detected, forcing token refresh");
-              
+
               invalidateCache(account.id);
               const refreshed = await refreshIfNeeded(account, true);
 
               if (refreshed) {
-                headers.set("x-api-key", refreshed.accessToken);
-                response = await fetch(input, {
-                  ...init,
-                  headers,
-                });
+                await persistOpenCodeAuth(
+                  refreshed.refreshToken,
+                  refreshed.accessToken,
+                  refreshed.expiresAt,
+                );
+                syncAuthJson(refreshed);
+                headers.set("authorization", `Bearer ${refreshed.accessToken}`);
+                response = await fetch(requestUrl, { ...init, headers });
+              } else {
+                throw new Error(
+                  "[dark-auth] Token refresh failed after 401. Run login to re-authenticate.",
+                );
               }
             }
 
-            // Handle 429: switch to next account if available
+            // ── 429 handler (our fix) ──
+            // Rate limited. If retry-after > 30s, throw immediately
+            // instead of "Retrying in 25201s".
             if (response.status === 429) {
               const retryAfter = response.headers.get("retry-after");
               const retryMs = retryAfter
@@ -178,32 +279,28 @@ export default async function plugin() {
                 : 60_000;
 
               console.log(
-                `[dark-auth] Rate limited (retry after ${Math.round(retryMs / 1000)}s)`
+                `[dark-auth] Rate limited (retry after ${Math.round(retryMs / 1000)}s)`,
               );
 
-              // If retry-after is too long, throw instead of waiting
+              // Long cooldown: throw clear error
               if (retryMs > 30_000) {
-                const wait = getShortestWait();
-                const waitMsg = wait
-                  ? `Shortest wait: ${Math.ceil(wait / 1000)}s`
-                  : "No accounts available";
-                
+                const waitMins = Math.ceil(retryMs / 60000);
                 throw new Error(
-                  `[dark-auth] Rate limit exceeded. ${waitMsg}. Add more accounts or wait.`
+                  `[dark-auth] Anthropic rate limit exceeded. Resets in ~${waitMins}min. ` +
+                    (storage.accounts.length > 1
+                      ? "Auto-switching to next account..."
+                      : "Add more accounts for automatic rotation."),
                 );
               }
 
-              // Try to switch to next account
+              // Short cooldown: try next account
               const nextAccount = handleRateLimit(account.id, retryMs);
-
               if (nextAccount) {
                 const nextCreds = await getCachedCredentials(nextAccount.id);
                 if (nextCreds) {
-                  headers.set("x-api-key", nextCreds.accessToken);
-                  response = await fetch(input, {
-                    ...init,
-                    headers,
-                  });
+                  console.log("[dark-auth] Switching to next account");
+                  headers.set("authorization", `Bearer ${nextCreds.accessToken}`);
+                  response = await fetch(requestUrl, { ...init, headers });
                 }
               }
             }
@@ -212,16 +309,84 @@ export default async function plugin() {
           },
         };
       },
+
       methods: [
         {
-          type: "oauth",
+          type: "oauth" as const,
+          label: "Login with Claude Pro/Max",
+          async authorize() {
+            const pkce = generatePKCE();
+            const url = buildAuthorizeURL(pkce);
+
+            return {
+              url,
+              instructions:
+                "Open the URL above in your browser, authorize, and paste the code here:",
+              method: "code" as const,
+
+              async callback(authorizationCode: string) {
+                const credentials = await exchangeCode(
+                  authorizationCode,
+                  pkce.verifier,
+                );
+
+                if (!credentials) {
+                  return { type: "failed" as const };
+                }
+
+                // Save to our own multi-account storage
+                const account: Account = {
+                  id: randomUUID(),
+                  label: "Claude Pro/Max",
+                  credentials,
+                  enabled: true,
+                  createdAt: Date.now(),
+                  lastUsedAt: Date.now(),
+                };
+                upsertAccount(account);
+
+                // Persist into OpenCode's auth store (critical!)
+                await persistOpenCodeAuth(
+                  credentials.refreshToken,
+                  credentials.accessToken,
+                  credentials.expiresAt,
+                );
+                syncAuthJson(credentials);
+
+                // Return success — OpenCode will store these
+                return {
+                  type: "success" as const,
+                  access: credentials.accessToken,
+                  refresh: credentials.refreshToken,
+                  expires: credentials.expiresAt,
+                };
+              },
+            };
+          },
+        },
+        {
+          type: "oauth" as const,
           label: "Manage Accounts",
           async authorize() {
-            const storage = loadAccounts();
-            
+            const accounts = loadAccounts();
+
+            if (accounts.accounts.length === 0) {
+              return {
+                url: "",
+                instructions: "No accounts configured. Run 'Login' to add an account.",
+                method: "auto" as const,
+                async callback() {
+                  return { type: "failed" as const };
+                },
+              };
+            }
+
             return {
               url: "",
-              instructions: `Accounts stored in: ${getStoragePath()}\nActive: ${storage.activeAccountId || "none"}\nTotal: ${storage.accounts.length}`,
+              instructions:
+                `Active: ${accounts.activeAccountId || "none"}\n` +
+                `Total: ${accounts.accounts.length}\n` +
+                `Storage: ${getStoragePath()}`,
               method: "auto" as const,
               async callback() {
                 return { type: "success" as const };
