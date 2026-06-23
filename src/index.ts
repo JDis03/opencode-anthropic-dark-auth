@@ -165,7 +165,7 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
 
         // We have oauth — return custom fetch with our fixes
         return {
-          apiKey: "oauth",
+          apiKey: "",
 
           async fetch(input: string | URL | Request, init?: RequestInit) {
             const account = getActiveAccount();
@@ -188,6 +188,7 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
             // The built-in Anthropic provider already sets stainless headers,
             // beta flags, user-agent, etc. We just need to provide the token.
             const headers = new Headers(init?.headers);
+            headers.delete("x-api-key");
             headers.set("Authorization", `Bearer ${credentials.accessToken}`);
 
             // Make the request
