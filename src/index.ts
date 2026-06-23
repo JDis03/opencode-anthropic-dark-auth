@@ -224,8 +224,8 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
             }
 
             // ── 429 handler (our fix) ──
-            // Rate limited. If retry-after > 30s, throw immediately
-            // instead of "Retrying in 25201s".
+            // Rate limited. If retry-after > 30s, return a non-retryable
+            // response so OpenCode doesn't loop with "Retrying in 25201s".
             if (response.status === 429) {
               const retryAfter = response.headers.get("retry-after");
               const retryMs = retryAfter
@@ -236,18 +236,39 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                 `[dark-auth] Rate limited (retry after ${Math.round(retryMs / 1000)}s)`,
               );
 
-              // Long cooldown: throw clear error
+              // Long cooldown (>30s): return non-retryable response.
+              // Setting x-should-retry: false tells OpenCode NOT to auto-retry.
               if (retryMs > 30_000) {
                 const waitMins = Math.ceil(retryMs / 60000);
-                throw new Error(
-                  `[dark-auth] Anthropic rate limit exceeded. Resets in ~${waitMins}min. ` +
-                    (storage.accounts.length > 1
-                      ? "Auto-switching to next account..."
-                      : "Add more accounts for automatic rotation."),
+                const message =
+                  `Anthropic rate limit exceeded. Resets in ~${waitMins}min. ` +
+                  (storage.accounts.length > 1
+                    ? "Auto-switching to next account..."
+                    : "Add more accounts for automatic rotation.");
+
+                const body = await response.text().catch(() => "");
+                let bodyObj: Record<string, any> = {};
+                if (body) {
+                  try { bodyObj = JSON.parse(body); } catch { bodyObj = { error: body }; }
+                }
+
+                // Copy headers (safe iteration — Object.fromEntries may fail on some Headers)
+                const copyHeaders: Record<string, string> = {};
+                response.headers.forEach((v: string, k: string) => { copyHeaders[k] = v; });
+                copyHeaders["x-should-retry"] = "false";
+                copyHeaders["content-type"] = "application/json";
+
+                return new Response(
+                  JSON.stringify({
+                    ...bodyObj,
+                    type: "error",
+                    error: { type: "rate_limit_error", message },
+                  }),
+                  { status: 429, statusText: "Rate Limited", headers: copyHeaders },
                 );
               }
 
-              // Short cooldown: try next account
+              // Short cooldown (≤30s): try next account if available
               const nextAccount = handleRateLimit(account.id, retryMs);
               if (nextAccount) {
                 const nextCreds = await getCachedCredentials(nextAccount.id);
