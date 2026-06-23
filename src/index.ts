@@ -168,6 +168,35 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
           apiKey: "",
 
           async fetch(input: string | URL | Request, init?: RequestInit) {
+            // Transform URL: add ?beta=true for /v1/messages endpoint.
+            // Without this, Anthropic routes through standard API (credits)
+            // instead of Claude Code beta pipeline (Pro/Max unlimited).
+            let requestInput: string | URL | Request = input;
+            try {
+              const url = new URL(
+                typeof input === "string"
+                  ? input
+                  : input instanceof URL
+                    ? input.toString()
+                    : (input as Request).url,
+              );
+              const isMessages =
+                url.pathname === "/v1/messages" ||
+                url.pathname === "/messages";
+              if (isMessages && !url.searchParams.has("beta")) {
+                if (!url.pathname.startsWith("/v1/")) {
+                  url.pathname = "/v1" + url.pathname;
+                }
+                url.searchParams.set("beta", "true");
+                requestInput =
+                  input instanceof Request
+                    ? new Request(url.toString(), input)
+                    : url.toString();
+              }
+            } catch {
+              // If URL parsing fails, use input as-is
+            }
+
             const account = getActiveAccount();
 
             if (!account) {
@@ -206,7 +235,7 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
             headers.set("anthropic-dangerous-direct-browser-access", "true");
 
             // Make the request
-            let response = await fetch(input, { ...init, headers });
+            let response = await fetch(requestInput, { ...init, headers });
 
             // ── 401 handler (our fix) ──
             // Token invalidated (e.g. running `claude` in terminal revoked
@@ -225,7 +254,7 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                 );
                 syncAuthJson(refreshed);
                 headers.set("authorization", `Bearer ${refreshed.accessToken}`);
-                response = await fetch(input, { ...init, headers });
+                response = await fetch(requestInput, { ...init, headers });
               } else {
                 throw new Error(
                   "[dark-auth] Token refresh failed after 401. Run login to re-authenticate.",
