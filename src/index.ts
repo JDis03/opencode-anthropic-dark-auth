@@ -195,6 +195,24 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
             headers.set("anthropic-beta", "oauth-2025-04-20");
             headers.set("x-app", "cli");
 
+            // Pre-flight rate limit check: if this account is already rate-limited,
+            // try switching to another account before even making the request.
+            const rateLimitUntil = account.rateLimitedUntil;
+            if (rateLimitUntil && rateLimitUntil > Date.now()) {
+              const remainingMs = rateLimitUntil - Date.now();
+              console.log(
+                `[dark-auth] Account rate-limited, ${Math.round(remainingMs / 60000)}min remaining`,
+              );
+              const fallback = handleRateLimit(account.id, remainingMs);
+              if (fallback) {
+                const fallbackCreds = await getCachedCredentials(fallback.id);
+                if (fallbackCreds) {
+                  console.log("[dark-auth] Pre-switching to fallback account");
+                  headers.set("authorization", `Bearer ${fallbackCreds.accessToken}`);
+                }
+              }
+            }
+
             // Make the request
             let response = await fetch(input, { ...init, headers });
 
@@ -236,15 +254,28 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                 `[dark-auth] Rate limited (retry after ${Math.round(retryMs / 1000)}s)`,
               );
 
+              // Always track the rate limit and try to switch accounts
+              const nextAccount = handleRateLimit(account.id, retryMs);
+
               // Long cooldown (>30s): return non-retryable response.
               // Setting x-should-retry: false tells OpenCode NOT to auto-retry.
               if (retryMs > 30_000) {
                 const waitMins = Math.ceil(retryMs / 60000);
+
+                // If we have another account, try it
+                if (nextAccount) {
+                  const nextCreds = await getCachedCredentials(nextAccount.id);
+                  if (nextCreds) {
+                    console.log("[dark-auth] Switching to next account (long cooldown)");
+                    headers.set("authorization", `Bearer ${nextCreds.accessToken}`);
+                    return fetch(input, { ...init, headers });
+                  }
+                }
+
+                // No other account — return non-retryable response
                 const message =
                   `Anthropic rate limit exceeded. Resets in ~${waitMins}min. ` +
-                  (storage.accounts.length > 1
-                    ? "Auto-switching to next account..."
-                    : "Add more accounts for automatic rotation.");
+                  "Add more accounts for automatic rotation.";
 
                 const body = await response.text().catch(() => "");
                 let bodyObj: Record<string, any> = {};
@@ -252,7 +283,7 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                   try { bodyObj = JSON.parse(body); } catch { bodyObj = { error: body }; }
                 }
 
-                // Copy headers (safe iteration — Object.fromEntries may fail on some Headers)
+                // Safe header copy
                 const copyHeaders: Record<string, string> = {};
                 response.headers.forEach((v: string, k: string) => { copyHeaders[k] = v; });
                 copyHeaders["x-should-retry"] = "false";
@@ -269,7 +300,6 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
               }
 
               // Short cooldown (≤30s): try next account if available
-              const nextAccount = handleRateLimit(account.id, retryMs);
               if (nextAccount) {
                 const nextCreds = await getCachedCredentials(nextAccount.id);
                 if (nextCreds) {
