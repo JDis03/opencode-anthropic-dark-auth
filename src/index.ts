@@ -256,9 +256,11 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
 
               // Always track the rate limit and try to switch accounts
               const nextAccount = handleRateLimit(account.id, retryMs);
+              account.rateLimitedUntil = Date.now() + retryMs;
 
-              // Long cooldown (>30s): return non-retryable response.
-              // Setting x-should-retry: false tells OpenCode NOT to auto-retry.
+              // Long cooldown (>30s): return a non-retryable response.
+              // OpenCode's retry.ts only retries 5xx or isRetryable errors.
+              // Status 400 (Bad Request) is not retryable — this stops the loop.
               if (retryMs > 30_000) {
                 const waitMins = Math.ceil(retryMs / 60000);
 
@@ -272,30 +274,20 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                   }
                 }
 
-                // No other account — return non-retryable response
-                const message =
-                  `Anthropic rate limit exceeded. Resets in ~${waitMins}min. ` +
-                  "Add more accounts for automatic rotation.";
-
-                const body = await response.text().catch(() => "");
-                let bodyObj: Record<string, any> = {};
-                if (body) {
-                  try { bodyObj = JSON.parse(body); } catch { bodyObj = { error: body }; }
-                }
-
-                // Safe header copy
-                const copyHeaders: Record<string, string> = {};
-                response.headers.forEach((v: string, k: string) => { copyHeaders[k] = v; });
-                copyHeaders["x-should-retry"] = "false";
-                copyHeaders["content-type"] = "application/json";
-
+                // No other account — return 400 (NOT 429) to prevent retry loop
                 return new Response(
                   JSON.stringify({
-                    ...bodyObj,
                     type: "error",
-                    error: { type: "rate_limit_error", message },
+                    error: {
+                      type: "rate_limit_error",
+                      message: `Rate limited. Resets in ~${waitMins}min. No other accounts available.`,
+                    },
                   }),
-                  { status: 429, statusText: "Rate Limited", headers: copyHeaders },
+                  {
+                    status: 400,
+                    statusText: "Rate Limited",
+                    headers: { "content-type": "application/json" },
+                  },
                 );
               }
 
