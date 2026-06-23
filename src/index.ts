@@ -1,9 +1,13 @@
 /**
  * opencode-anthropic-dark-auth
  * Anthropic OAuth plugin for OpenCode with multi-account support
+ * Original implementation — not a fork. Own architecture, own fixes.
  */
 
 import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import type { Account } from "./types.js";
 import { generatePKCE, buildAuthorizeURL, exchangeCode } from "./oauth.js";
 import {
@@ -20,10 +24,41 @@ import {
   invalidateCache,
   handleRateLimit,
   getShortestWait,
+  updateConfig,
 } from "./accounts.js";
 
-// Track pending OAuth flows
-const pendingOAuthFlows = new Map<string, { verifier: string; createdAt: number }>();
+const PROACTIVE_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
+const PROACTIVE_REFRESH_THRESHOLD = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Sync credentials to OpenCode's auth.json so the built-in provider
+ * can also read them if needed.
+ */
+function syncAuthJson(credentials: { accessToken: string; refreshToken: string; expiresAt: number }): void {
+  const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
+  const dir = join(homedir(), ".local", "share", "opencode");
+  
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+  
+  let auth: Record<string, any> = {};
+  if (existsSync(authPath)) {
+    try {
+      auth = JSON.parse(readFileSync(authPath, "utf-8"));
+    } catch { /* malformed, start fresh */ }
+  }
+  
+  auth.anthropic = {
+    type: "oauth",
+    access: credentials.accessToken,
+    refresh: credentials.refreshToken,
+    expires: credentials.expiresAt,
+  };
+  
+  writeFileSync(authPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+  chmodSync(authPath, 0o600);
+}
 
 /**
  * OpenCode plugin export
@@ -34,7 +69,7 @@ export default async function plugin() {
   const storage = loadAccounts();
   console.log(`[dark-auth] Loaded ${storage.accounts.length} account(s)`);
 
-  // If no accounts, return empty config (user needs to login)
+  // If no accounts, return login-only config
   if (storage.accounts.length === 0) {
     console.log("[dark-auth] No accounts found. Use login method to authenticate.");
     return {
@@ -50,28 +85,15 @@ export default async function plugin() {
             async authorize() {
               const pkce = generatePKCE();
               const url = buildAuthorizeURL(pkce);
-              const flowId = randomUUID();
-
-              pendingOAuthFlows.set(flowId, {
-                verifier: pkce.verifier,
-                createdAt: Date.now(),
-              });
 
               return {
                 url,
                 instructions: "Open the URL above in your browser, authorize, and paste the code here:",
                 method: "code" as const,
                 async callback(authorizationCode: string) {
-                  const flow = pendingOAuthFlows.get(flowId);
-                  if (!flow) {
-                    return { type: "failed" as const };
-                  }
-
-                  pendingOAuthFlows.delete(flowId);
-
                   const credentials = await exchangeCode(
                     authorizationCode,
-                    flow.verifier
+                    pkce.verifier
                   );
 
                   if (!credentials) {
@@ -88,6 +110,7 @@ export default async function plugin() {
                   };
 
                   upsertAccount(account);
+                  syncAuthJson(credentials);
 
                   return {
                     type: "success" as const,
@@ -105,7 +128,35 @@ export default async function plugin() {
     };
   }
 
-  // Has accounts - provide auth loader with custom fetch
+  // === Has accounts — start proactive refresh timer ===
+  // Every 5 minutes, check if any account's token is expiring within 1 hour.
+  // If so, refresh it proactively — our fix from the opencode-claude-auth work.
+  const refreshTimer = setInterval(async () => {
+    try {
+      const current = getActiveAccount();
+      if (!current) return;
+
+      const expiresIn = current.credentials.expiresAt - Date.now();
+
+      if (expiresIn < PROACTIVE_REFRESH_THRESHOLD) {
+        console.log(
+          `[dark-auth] Proactive refresh: token expires in ${Math.round(expiresIn / 60000)}min`
+        );
+        const refreshed = await refreshIfNeeded(current, true);
+        if (refreshed) {
+          syncAuthJson(refreshed);
+          console.log("[dark-auth] Proactive refresh successful");
+        }
+      }
+    } catch {
+      // Non-fatal: timer keeps running
+    }
+  }, PROACTIVE_REFRESH_INTERVAL);
+
+  // Allow Node/Bun to exit even if timer is running
+  refreshTimer.unref();
+
+  // === Provide auth loader with all our fixes ===
   return {
     auth: {
       provider: "anthropic",
@@ -122,18 +173,18 @@ export default async function plugin() {
         }
 
         return {
-          apiKey: "", // Not used, we provide custom fetch
+          apiKey: "",
           baseURL: "https://api.anthropic.com/v1",
           async fetch(input: string | URL | Request, init?: RequestInit) {
             const account = getActiveAccount();
-            
+
             if (!account) {
               throw new Error(
                 "[dark-auth] No active account. Run login to authenticate."
               );
             }
 
-            // Get fresh credentials (with caching and proactive refresh)
+            // Get credentials with proactive refresh
             const credentials = await getCachedCredentials(account.id);
 
             if (!credentials) {
@@ -153,23 +204,31 @@ export default async function plugin() {
               headers,
             });
 
-            // Handle 401: force refresh and retry
+            // Handle 401: token invalidated (e.g. running `claude` in terminal
+            // revoked our refresh token). Invalidate cache and force refresh.
+            // Our fix from the opencode-claude-auth work.
             if (response.status === 401) {
               console.log("[dark-auth] 401 detected, forcing token refresh");
-              
+
               invalidateCache(account.id);
               const refreshed = await refreshIfNeeded(account, true);
 
               if (refreshed) {
+                syncAuthJson(refreshed);
                 headers.set("x-api-key", refreshed.accessToken);
                 response = await fetch(input, {
                   ...init,
                   headers,
                 });
+              } else {
+                throw new Error(
+                  "[dark-auth] Token refresh failed after 401. Run `claude` to re-authenticate."
+                );
               }
             }
 
-            // Handle 429: switch to next account if available
+            // Handle 429: rate limited. Our fix from the opencode-claude-auth work:
+            // if retry-after > 30s, throw immediately instead of "Retrying in 25201s".
             if (response.status === 429) {
               const retryAfter = response.headers.get("retry-after");
               const retryMs = retryAfter
@@ -180,24 +239,24 @@ export default async function plugin() {
                 `[dark-auth] Rate limited (retry after ${Math.round(retryMs / 1000)}s)`
               );
 
-              // If retry-after is too long, throw instead of waiting
+              // Long retry-after (>30s): throw clear error, no "Retrying in Xs"
               if (retryMs > 30_000) {
-                const wait = getShortestWait();
-                const waitMsg = wait
-                  ? `Shortest wait: ${Math.ceil(wait / 1000)}s`
-                  : "No accounts available";
-                
+                const waitMins = Math.ceil(retryMs / 60000);
                 throw new Error(
-                  `[dark-auth] Rate limit exceeded. ${waitMsg}. Add more accounts or wait.`
+                  `[dark-auth] Anthropic rate limit exceeded. Resets in ~${waitMins}min. ` +
+                  (storage.accounts.length > 1
+                    ? "Auto-switching to next account..."
+                    : "Add more accounts for automatic rotation.")
                 );
               }
 
-              // Try to switch to next account
+              // Short retry: try switching to next available account
               const nextAccount = handleRateLimit(account.id, retryMs);
 
               if (nextAccount) {
                 const nextCreds = await getCachedCredentials(nextAccount.id);
                 if (nextCreds) {
+                  console.log("[dark-auth] Switching to next account");
                   headers.set("x-api-key", nextCreds.accessToken);
                   response = await fetch(input, {
                     ...init,
@@ -216,11 +275,22 @@ export default async function plugin() {
           type: "oauth",
           label: "Manage Accounts",
           async authorize() {
-            const storage = loadAccounts();
-            
+            const accounts = loadAccounts();
+
+            if (accounts.accounts.length === 0) {
+              return {
+                url: "",
+                instructions: "No accounts configured. Re-run to add accounts.",
+                method: "auto" as const,
+                async callback() {
+                  return { type: "failed" as const };
+                },
+              };
+            }
+
             return {
               url: "",
-              instructions: `Accounts stored in: ${getStoragePath()}\nActive: ${storage.activeAccountId || "none"}\nTotal: ${storage.accounts.length}`,
+              instructions: `Active: ${accounts.activeAccountId || "none"}\nTotal: ${accounts.accounts.length}\nStorage: ${getStoragePath()}`,
               method: "auto" as const,
               async callback() {
                 return { type: "success" as const };
@@ -232,3 +302,4 @@ export default async function plugin() {
     },
   };
 }
+
