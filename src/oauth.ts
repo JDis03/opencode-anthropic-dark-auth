@@ -6,12 +6,15 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { OAuthCredentials, OAuthState } from "./types.js";
 
-// Anthropic OAuth endpoints
+// Anthropic OAuth endpoints (matching opencode-anthropic-fix)
 const AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 const TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback";
 const SCOPE = "org:create_api_key user:profile user:inference";
+
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 2000; // 2 seconds base
 
 /**
  * Generate PKCE challenge and verifier
@@ -86,47 +89,65 @@ export async function exchangeCode(
 
   console.log("[dark-auth] Exchanging code for tokens...");
 
-  try {
-    const response = await fetch(TOKEN_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        grant_type: "authorization_code",
-        client_id: CLIENT_ID,
-        code,
-        state,
-        redirect_uri: REDIRECT_URI,
-        code_verifier: verifier,
-      }),
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text().catch(() => "");
-      console.error(
-        `[dark-auth] Token exchange failed: ${response.status} — ${errorBody.slice(0, 200)}`
-      );
-      return null;
+  // Retry with backoff for transient errors (rate limits, network)
+  let lastError: string | null = null;
+  
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+      console.log(`[dark-auth] Retrying exchange in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await new Promise((r) => setTimeout(r, delay));
     }
 
-    const data = await response.json() as {
-      access_token: string;
-      refresh_token: string;
-      expires_in: number;
-    };
+    try {
+      const response = await fetch(TOKEN_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          grant_type: "authorization_code",
+          client_id: CLIENT_ID,
+          code,
+          state,
+          redirect_uri: REDIRECT_URI,
+          code_verifier: verifier,
+        }),
+      });
 
-    console.log("[dark-auth] Token exchange successful");
-    
-    return {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token,
-      expiresAt: Date.now() + data.expires_in * 1000,
-    };
-  } catch (error) {
-    console.error("[dark-auth] Token exchange error:", error);
-    return null;
+      if (response.ok) {
+        const data = await response.json() as {
+          access_token: string;
+          refresh_token: string;
+          expires_in: number;
+        };
+        console.log("[dark-auth] Token exchange successful");
+        return {
+          accessToken: data.access_token,
+          refreshToken: data.refresh_token,
+          expiresAt: Date.now() + data.expires_in * 1000,
+        };
+      }
+
+      // Read error body
+      const errorBody = await response.text().catch(() => "");
+      lastError = `${response.status} — ${errorBody.slice(0, 200)}`;
+      console.error(`[dark-auth] Token exchange attempt ${attempt + 1} failed: ${lastError}`);
+
+      // Don't retry on client errors (4xx except 429)
+      if (response.status === 429 || response.status >= 500) {
+        continue; // Rate limit or server error — retryable
+      }
+      break; // Other 4xx (400, 401, 403) — not retryable
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      console.error(`[dark-auth] Token exchange error (attempt ${attempt + 1}): ${lastError}`);
+      // Network errors are retryable
+    }
   }
+
+  console.error(`[dark-auth] Token exchange exhausted: ${lastError}`);
+  return null;
 }
 
 /**
