@@ -1,0 +1,133 @@
+/**
+ * Account storage management
+ * Stores accounts in ~/.config/opencode/dark-auth-accounts.json
+ */
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import type { Account, AccountStorage } from "./types.js";
+
+const DEFAULT_STORAGE: AccountStorage = {
+  version: 1,
+  accounts: [],
+  activeAccountId: null,
+};
+
+/**
+ * Get storage file path
+ */
+export function getStoragePath(): string {
+  return join(homedir(), ".config", "opencode", "dark-auth-accounts.json");
+}
+
+/**
+ * Load accounts from disk
+ */
+export function loadAccounts(): AccountStorage {
+  const path = getStoragePath();
+  
+  if (!existsSync(path)) {
+    return { ...DEFAULT_STORAGE };
+  }
+
+  try {
+    const content = readFileSync(path, "utf-8");
+    const data = JSON.parse(content) as AccountStorage;
+    
+    // Validate structure
+    if (!data.version || !Array.isArray(data.accounts)) {
+      console.warn("[dark-auth] Invalid storage format, resetting");
+      return { ...DEFAULT_STORAGE };
+    }
+
+    // Clean up expired rate limits
+    data.accounts = data.accounts.map((account) => {
+      if (account.rateLimitedUntil && account.rateLimitedUntil < Date.now()) {
+        const { rateLimitedUntil, ...rest } = account;
+        return rest as Account;
+      }
+      return account;
+    });
+
+    return data;
+  } catch (error) {
+    console.error("[dark-auth] Failed to load accounts:", error);
+    return { ...DEFAULT_STORAGE };
+  }
+}
+
+/**
+ * Save accounts to disk atomically
+ */
+export function saveAccounts(storage: AccountStorage): void {
+  const path = getStoragePath();
+  const dir = join(homedir(), ".config", "opencode");
+
+  // Ensure directory exists
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+
+  // Atomic write: temp file → rename
+  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  const content = JSON.stringify(storage, null, 2) + "\n";
+
+  try {
+    writeFileSync(tempPath, content, { encoding: "utf-8", mode: 0o600 });
+    renameSync(tempPath, path);
+  } catch (error) {
+    console.error("[dark-auth] Failed to save accounts:", error);
+    throw error;
+  }
+}
+
+/**
+ * Add or update an account
+ */
+export function upsertAccount(account: Account): void {
+  const storage = loadAccounts();
+  
+  const existingIndex = storage.accounts.findIndex((a) => a.id === account.id);
+  
+  if (existingIndex >= 0) {
+    storage.accounts[existingIndex] = account;
+  } else {
+    storage.accounts.push(account);
+  }
+
+  // Set as active if it's the first account
+  if (!storage.activeAccountId) {
+    storage.activeAccountId = account.id;
+  }
+
+  saveAccounts(storage);
+}
+
+/**
+ * Get active account
+ */
+export function getActiveAccount(): Account | null {
+  const storage = loadAccounts();
+  
+  if (!storage.activeAccountId) {
+    return storage.accounts[0] || null;
+  }
+
+  return storage.accounts.find((a) => a.id === storage.activeAccountId) || null;
+}
+
+/**
+ * Set active account by ID
+ */
+export function setActiveAccount(accountId: string): void {
+  const storage = loadAccounts();
+  
+  const account = storage.accounts.find((a) => a.id === accountId);
+  if (!account) {
+    throw new Error(`Account ${accountId} not found`);
+  }
+
+  storage.activeAccountId = accountId;
+  saveAccounts(storage);
+}

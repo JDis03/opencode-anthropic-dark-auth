@@ -1,0 +1,42 @@
+{
+  "name": "opencode-anthropic-dark-auth",
+  "version": "1.0.0",
+  "description": "Anthropic OAuth authentication plugin for OpenCode with multi-account support and proactive token refresh",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "opencode",
+    "anthropic",
+    "claude",
+    "oauth",
+    "auth",
+    "plugin",
+    "multi-account"
+  ],
+  "author": "DarkRed",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
