@@ -166,7 +166,6 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
         // We have oauth — return custom fetch with our fixes
         return {
           apiKey: "",
-          baseURL: "https://api.anthropic.com/v1",
 
           async fetch(input: string | URL | Request, init?: RequestInit) {
             const account = getActiveAccount();
