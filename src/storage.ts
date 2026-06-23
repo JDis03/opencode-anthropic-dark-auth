@@ -48,11 +48,13 @@ export function getAuthJsonPath(): string {
 
 /**
  * Import account from OpenCode's auth.json (first-time migration)
+ * Only imports if credentials exist and are valid OAuth tokens
  */
 export function importFromAuthJson(): Account | null {
   const authPath = getAuthJsonPath();
   
   if (!existsSync(authPath)) {
+    logToFile("[import] auth.json does not exist");
     return null;
   }
 
@@ -69,8 +71,18 @@ export function importFromAuthJson(): Account | null {
 
     const anthropic = parsed.anthropic;
     if (!anthropic || anthropic.type !== "oauth" || !anthropic.refresh) {
+      logToFile("[import] No valid OAuth credentials in auth.json", { 
+        hasAnthropicKey: !!anthropic,
+        type: anthropic?.type,
+        hasRefresh: !!anthropic?.refresh,
+      });
       return null;
     }
+
+    logToFile("[import] Found OAuth credentials in auth.json", {
+      hasAccess: !!anthropic.access,
+      expires: anthropic.expires,
+    });
 
     return {
       id: randomUUID(),
@@ -84,7 +96,8 @@ export function importFromAuthJson(): Account | null {
       createdAt: Date.now(),
       lastUsedAt: Date.now(),
     };
-  } catch {
+  } catch (err) {
+    logToFile("[import] Failed to parse auth.json", { error: String(err) });
     return null;
   }
 }
