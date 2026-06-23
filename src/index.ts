@@ -187,9 +187,13 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
             }
 
             // Build request with auth header
+            // OAuth tokens use Authorization: Bearer (NOT x-api-key)
             const headers = new Headers(init?.headers);
-            headers.set("x-api-key", credentials.accessToken);
+            headers.delete("x-api-key");
+            headers.set("authorization", `Bearer ${credentials.accessToken}`);
             headers.set("anthropic-version", "2023-06-01");
+            headers.set("anthropic-beta", "oauth-2025-04-20");
+            headers.set("x-app", "cli");
 
             // Make the request
             let response = await fetch(input, { ...init, headers });
@@ -210,7 +214,7 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                   refreshed.expiresAt,
                 );
                 syncAuthJson(refreshed);
-                headers.set("x-api-key", refreshed.accessToken);
+                headers.set("authorization", `Bearer ${refreshed.accessToken}`);
                 response = await fetch(input, { ...init, headers });
               } else {
                 throw new Error(
@@ -249,7 +253,7 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                 const nextCreds = await getCachedCredentials(nextAccount.id);
                 if (nextCreds) {
                   console.log("[dark-auth] Switching to next account");
-                  headers.set("x-api-key", nextCreds.accessToken);
+                  headers.set("authorization", `Bearer ${nextCreds.accessToken}`);
                   response = await fetch(input, { ...init, headers });
                 }
               }
