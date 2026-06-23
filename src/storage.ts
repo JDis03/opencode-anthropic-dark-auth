@@ -47,6 +47,82 @@ export function getAuthJsonPath(): string {
 }
 
 /**
+ * Get Claude Code credentials file path
+ */
+export function getClaudeCredentialsPath(): string {
+  return join(homedir(), ".claude", ".credentials.json");
+}
+
+/**
+ * Import account from Claude Code's .credentials.json
+ */
+export function importFromClaudeCode(): Account | null {
+  const credPath = getClaudeCredentialsPath();
+  
+  if (!existsSync(credPath)) {
+    logToFile("[import] Claude Code credentials file does not exist");
+    return null;
+  }
+
+  try {
+    const raw = readFileSync(credPath, "utf-8");
+    const parsed = JSON.parse(raw) as {
+      claudeAiOauth?: {
+        accessToken?: string;
+        refreshToken?: string;
+        expiresAt?: number;
+        subscriptionType?: string;
+      };
+      accessToken?: string;
+      refreshToken?: string;
+      expiresAt?: number;
+      subscriptionType?: string;
+    };
+
+    // Try wrapped format first (claudeAiOauth)
+    const creds = parsed.claudeAiOauth ?? parsed;
+
+    if (
+      typeof creds.accessToken !== "string" ||
+      typeof creds.refreshToken !== "string" ||
+      typeof creds.expiresAt !== "number"
+    ) {
+      logToFile("[import] Invalid Claude Code credentials format", {
+        hasAccessToken: typeof creds.accessToken === "string",
+        hasRefreshToken: typeof creds.refreshToken === "string",
+        hasExpiry: typeof creds.expiresAt === "number",
+      });
+      return null;
+    }
+
+    const label = creds.subscriptionType
+      ? `Claude ${creds.subscriptionType.charAt(0).toUpperCase()}${creds.subscriptionType.slice(1)}`
+      : "Claude Code";
+
+    logToFile("[import] Successfully imported from Claude Code", {
+      label,
+      expires: creds.expiresAt,
+    });
+
+    return {
+      id: randomUUID(),
+      label,
+      credentials: {
+        accessToken: creds.accessToken,
+        refreshToken: creds.refreshToken,
+        expiresAt: creds.expiresAt,
+      },
+      enabled: true,
+      createdAt: Date.now(),
+      lastUsedAt: Date.now(),
+    };
+  } catch (err) {
+    logToFile("[import] Failed to parse Claude Code credentials", { error: String(err) });
+    return null;
+  }
+}
+
+/**
  * Import account from OpenCode's auth.json (first-time migration)
  * Only imports if credentials exist and are valid OAuth tokens
  */

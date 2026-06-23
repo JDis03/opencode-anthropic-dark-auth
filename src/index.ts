@@ -19,6 +19,7 @@ import {
   upsertAccount,
   getActiveAccount,
   getStoragePath,
+  importFromClaudeCode,
   importFromAuthJson,
   logToFile,
 } from "./storage.js";
@@ -43,20 +44,34 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
   logToFile(`[dark-auth] Loaded ${storage.accounts.length} account(s)`);
   console.log(`[dark-auth] Loaded ${storage.accounts.length} account(s)`);
 
-  // ── First-time migration: import from auth.json if no accounts ──
+  // ── First-time migration: import from Claude Code or OpenCode auth ──
   if (storage.accounts.length === 0) {
-    logToFile("[dark-auth] No accounts found, attempting import from auth.json");
-    const imported = importFromAuthJson();
+    logToFile("[dark-auth] No accounts found, attempting import");
+    
+    // Try Claude Code first (official source)
+    let imported = importFromClaudeCode();
     if (imported) {
-      logToFile("[dark-auth] Successfully imported account from auth.json", {
+      logToFile("[dark-auth] Successfully imported from Claude Code", {
         label: imported.label,
         expiresAt: imported.credentials.expiresAt,
       });
       upsertAccount(imported);
       storage = loadAccounts();
-      console.log("[dark-auth] Imported account from OpenCode auth.json");
+      console.log("[dark-auth] Imported account from Claude Code");
     } else {
-      logToFile("[dark-auth] No valid OAuth credentials in auth.json");
+      // Fallback to OpenCode auth.json
+      imported = importFromAuthJson();
+      if (imported) {
+        logToFile("[dark-auth] Successfully imported from OpenCode auth.json", {
+          label: imported.label,
+          expiresAt: imported.credentials.expiresAt,
+        });
+        upsertAccount(imported);
+        storage = loadAccounts();
+        console.log("[dark-auth] Imported account from OpenCode auth.json");
+      } else {
+        logToFile("[dark-auth] No credentials found in Claude Code or OpenCode");
+      }
     }
   }
 
