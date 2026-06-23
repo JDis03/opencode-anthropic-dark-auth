@@ -188,30 +188,24 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
 
             // Build request with auth header
             // OAuth tokens use Authorization: Bearer (NOT x-api-key)
+            // Stainless headers match the official Claude Code client fingerprint —
+            // without them Anthropic routes to credits billing, not Pro/Max unlimited.
             const headers = new Headers(init?.headers);
             headers.delete("x-api-key");
             headers.set("authorization", `Bearer ${credentials.accessToken}`);
             headers.set("anthropic-version", "2023-06-01");
             headers.set("anthropic-beta", "oauth-2025-04-20");
             headers.set("x-app", "cli");
-
-            // Pre-flight rate limit check: if this account is already rate-limited,
-            // try switching to another account before even making the request.
-            const rateLimitUntil = account.rateLimitedUntil;
-            if (rateLimitUntil && rateLimitUntil > Date.now()) {
-              const remainingMs = rateLimitUntil - Date.now();
-              console.log(
-                `[dark-auth] Account rate-limited, ${Math.round(remainingMs / 60000)}min remaining`,
-              );
-              const fallback = handleRateLimit(account.id, remainingMs);
-              if (fallback) {
-                const fallbackCreds = await getCachedCredentials(fallback.id);
-                if (fallbackCreds) {
-                  console.log("[dark-auth] Pre-switching to fallback account");
-                  headers.set("authorization", `Bearer ${fallbackCreds.accessToken}`);
-                }
-              }
-            }
+            headers.set("user-agent", "claude-cli/2.1.159 (external, cli)");
+            headers.set("x-stainless-arch", process.arch === "arm64" ? "arm64" : "x64");
+            headers.set("x-stainless-lang", "js");
+            headers.set("x-stainless-os", process.platform === "darwin" ? "macOS" : process.platform === "win32" ? "Windows" : "Linux");
+            headers.set("x-stainless-package-version", "0.94.0");
+            headers.set("x-stainless-runtime", "node");
+            headers.set("x-stainless-runtime-version", process.version);
+            headers.set("x-stainless-retry-count", "0");
+            headers.set("x-stainless-timeout", "600");
+            headers.set("anthropic-dangerous-direct-browser-access", "true");
 
             // Make the request
             let response = await fetch(input, { ...init, headers });
@@ -238,67 +232,6 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                 throw new Error(
                   "[dark-auth] Token refresh failed after 401. Run login to re-authenticate.",
                 );
-              }
-            }
-
-            // ── 429 handler (our fix) ──
-            // Rate limited. If retry-after > 30s, return a non-retryable
-            // response so OpenCode doesn't loop with "Retrying in 25201s".
-            if (response.status === 429) {
-              const retryAfter = response.headers.get("retry-after");
-              const retryMs = retryAfter
-                ? parseInt(retryAfter, 10) * 1000
-                : 60_000;
-
-              console.log(
-                `[dark-auth] Rate limited (retry after ${Math.round(retryMs / 1000)}s)`,
-              );
-
-              // Always track the rate limit and try to switch accounts
-              const nextAccount = handleRateLimit(account.id, retryMs);
-              account.rateLimitedUntil = Date.now() + retryMs;
-
-              // Long cooldown (>30s): return a non-retryable response.
-              // OpenCode's retry.ts only retries 5xx or isRetryable errors.
-              // Status 400 (Bad Request) is not retryable — this stops the loop.
-              if (retryMs > 30_000) {
-                const waitMins = Math.ceil(retryMs / 60000);
-
-                // If we have another account, try it
-                if (nextAccount) {
-                  const nextCreds = await getCachedCredentials(nextAccount.id);
-                  if (nextCreds) {
-                    console.log("[dark-auth] Switching to next account (long cooldown)");
-                    headers.set("authorization", `Bearer ${nextCreds.accessToken}`);
-                    return fetch(input, { ...init, headers });
-                  }
-                }
-
-                // No other account — return 400 (NOT 429) to prevent retry loop
-                return new Response(
-                  JSON.stringify({
-                    type: "error",
-                    error: {
-                      type: "rate_limit_error",
-                      message: `Rate limited. Resets in ~${waitMins}min. No other accounts available.`,
-                    },
-                  }),
-                  {
-                    status: 400,
-                    statusText: "Rate Limited",
-                    headers: { "content-type": "application/json" },
-                  },
-                );
-              }
-
-              // Short cooldown (≤30s): try next account if available
-              if (nextAccount) {
-                const nextCreds = await getCachedCredentials(nextAccount.id);
-                if (nextCreds) {
-                  console.log("[dark-auth] Switching to next account");
-                  headers.set("authorization", `Bearer ${nextCreds.accessToken}`);
-                  response = await fetch(input, { ...init, headers });
-                }
               }
             }
 
