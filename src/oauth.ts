@@ -51,11 +51,26 @@ export function buildAuthorizeURL(state: OAuthState): string {
 
 /**
  * Exchange authorization code for tokens
+ * callbackValue is the full callback URL or code#state string from OpenCode
  */
 export async function exchangeCode(
-  code: string,
+  callbackValue: string,
   verifier: string
 ): Promise<OAuthCredentials | null> {
+  // Parse Anthropic callback: ?code=CODE#state=STATE
+  const parts = callbackValue.split("#");
+  const codePart = parts[0] || "";
+  const state = parts[1] || "";
+
+  // Extract code from URL or string
+  let code = codePart;
+  try {
+    const url = new URL(codePart);
+    code = url.searchParams.get("code") || codePart;
+  } catch {
+    // Not a URL, use as-is
+  }
+
   try {
     const response = await fetch(TOKEN_URL, {
       method: "POST",
@@ -68,6 +83,7 @@ export async function exchangeCode(
         code,
         code_verifier: verifier,
         redirect_uri: REDIRECT_URI,
+        state,
       }).toString(),
     });
 

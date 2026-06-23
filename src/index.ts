@@ -59,9 +59,8 @@ export default async function plugin() {
 
               return {
                 url,
-                instructions:
-                  "Open the URL above in your browser to authorize with your Claude Pro/Max account.",
-                method: "manual" as const,
+                instructions: "Open the URL above in your browser, authorize, and paste the code here:",
+                method: "code" as const,
                 async callback(authorizationCode: string) {
                   const flow = pendingOAuthFlows.get(flowId);
                   if (!flow) {
