@@ -3,10 +3,28 @@
  * Stores accounts in ~/.config/opencode/dark-auth-accounts.json
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { Account, AccountStorage } from "./types.js";
+
+/**
+ * Log to file for debugging
+ */
+export function logToFile(message: string, data?: any): void {
+  const logPath = join(homedir(), ".local", "share", "opencode", "dark-auth.log");
+  const timestamp = new Date().toISOString();
+  const logLine = data 
+    ? `[${timestamp}] ${message} ${JSON.stringify(data)}\n`
+    : `[${timestamp}] ${message}\n`;
+  
+  try {
+    appendFileSync(logPath, logLine, "utf-8");
+  } catch {
+    // Ignore logging errors
+  }
+}
 
 const DEFAULT_STORAGE: AccountStorage = {
   version: 1,
@@ -19,6 +37,56 @@ const DEFAULT_STORAGE: AccountStorage = {
  */
 export function getStoragePath(): string {
   return join(homedir(), ".config", "opencode", "dark-auth-accounts.json");
+}
+
+/**
+ * Get OpenCode auth.json path
+ */
+export function getAuthJsonPath(): string {
+  return join(homedir(), ".local", "share", "opencode", "auth.json");
+}
+
+/**
+ * Import account from OpenCode's auth.json (first-time migration)
+ */
+export function importFromAuthJson(): Account | null {
+  const authPath = getAuthJsonPath();
+  
+  if (!existsSync(authPath)) {
+    return null;
+  }
+
+  try {
+    const raw = readFileSync(authPath, "utf-8");
+    const parsed = JSON.parse(raw) as {
+      anthropic?: {
+        type?: string;
+        refresh?: string;
+        access?: string;
+        expires?: number;
+      };
+    };
+
+    const anthropic = parsed.anthropic;
+    if (!anthropic || anthropic.type !== "oauth" || !anthropic.refresh) {
+      return null;
+    }
+
+    return {
+      id: randomUUID(),
+      label: "Imported from OpenCode",
+      credentials: {
+        accessToken: anthropic.access || "",
+        refreshToken: anthropic.refresh,
+        expiresAt: anthropic.expires || Date.now() + 3600000,
+      },
+      enabled: true,
+      createdAt: Date.now(),
+      lastUsedAt: Date.now(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**

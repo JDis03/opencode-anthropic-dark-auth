@@ -19,6 +19,8 @@ import {
   upsertAccount,
   getActiveAccount,
   getStoragePath,
+  importFromAuthJson,
+  logToFile,
 } from "./storage.js";
 import {
   getCachedCredentials,
@@ -34,10 +36,29 @@ const PROACTIVE_REFRESH_THRESHOLD = 60 * 60 * 1000;
 const sessionId = randomUUID();
 
 export default async function darkAuthPlugin({ client }: { client: any }) {
+  logToFile("[dark-auth] Initializing plugin");
   console.log("[dark-auth] Initializing plugin");
 
-  const storage = loadAccounts();
+  let storage = loadAccounts();
+  logToFile(`[dark-auth] Loaded ${storage.accounts.length} account(s)`);
   console.log(`[dark-auth] Loaded ${storage.accounts.length} account(s)`);
+
+  // ── First-time migration: import from auth.json if no accounts ──
+  if (storage.accounts.length === 0) {
+    logToFile("[dark-auth] No accounts found, attempting import from auth.json");
+    const imported = importFromAuthJson();
+    if (imported) {
+      logToFile("[dark-auth] Successfully imported account from auth.json", {
+        label: imported.label,
+        expiresAt: imported.credentials.expiresAt,
+      });
+      upsertAccount(imported);
+      storage = loadAccounts();
+      console.log("[dark-auth] Imported account from OpenCode auth.json");
+    } else {
+      logToFile("[dark-auth] No valid OAuth credentials in auth.json");
+    }
+  }
 
   // ── Persist into OpenCode's internal auth store ──
   // This is what getAuth() reads from. Without this, OpenCode never knows
@@ -252,13 +273,16 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
             if (response.status !== 200) {
               const cloned = response.clone();
               const body = await cloned.text().catch(() => "");
-              console.log(`[dark-auth] Response ${response.status}:`, body.substring(0, 500));
+              const logMsg = `Response ${response.status}: ${body.substring(0, 500)}`;
+              logToFile(`[dark-auth] ${logMsg}`);
+              console.log(`[dark-auth] ${logMsg}`);
             }
 
             // ── 401 handler (our fix) ──
             // Token invalidated (e.g. running `claude` in terminal revoked
             // our refresh token). Invalidate cache, force refresh, retry once.
             if (response.status === 401) {
+              logToFile("[dark-auth] 401 detected, forcing token refresh");
               console.log("[dark-auth] 401 detected, forcing token refresh");
 
               invalidateCache(account.id);
@@ -289,9 +313,9 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                 ? parseInt(retryAfter, 10) * 1000
                 : 60_000;
 
-              console.log(
-                `[dark-auth] Rate limited (retry after ${Math.round(retryMs / 1000)}s)`,
-              );
+              const msg = `Rate limited (retry after ${Math.round(retryMs / 1000)}s)`;
+              logToFile(`[dark-auth] ${msg}`, { retryAfter, retryMs });
+              console.log(`[dark-auth] ${msg}`);
 
               // Long cooldown: throw clear error
               if (retryMs > 30_000) {
