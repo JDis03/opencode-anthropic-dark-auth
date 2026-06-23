@@ -235,7 +235,18 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
             headers.set("anthropic-dangerous-direct-browser-access", "true");
 
             // Make the request
+            if (requestInput !== input) {
+              console.log("[dark-auth] URL transformed:", 
+                typeof requestInput === "string" ? requestInput : 
+                requestInput instanceof Request ? (requestInput as Request).url : 
+                requestInput.toString());
+            }
             let response = await fetch(requestInput, { ...init, headers });
+            if (response.status !== 200) {
+              const cloned = response.clone();
+              const body = await cloned.text().catch(() => "");
+              console.log(`[dark-auth] Response ${response.status}:`, body.slice(0, 300));
+            }
 
             // ── 401 handler (our fix) ──
             // Token invalidated (e.g. running `claude` in terminal revoked
