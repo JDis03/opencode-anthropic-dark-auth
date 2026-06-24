@@ -1,61 +1,50 @@
 # opencode-anthropic-dark-auth
 
-Anthropic OAuth authentication plugin for OpenCode with multi-account support and proactive token refresh.
+OpenCode plugin that uses your Claude Code credentials — no separate login needed.
 
-## Features
+## Prerequisites
 
-- ✅ **Own OAuth PKCE flow** - No dependency on `claude` CLI
-- ✅ **Multi-account support** - Add multiple Claude Pro/Max accounts
-- ✅ **Proactive token refresh** - Refreshes tokens 1 hour before expiry
-- ✅ **Rate limit handling** - Auto-switches to next available account
-- ✅ **Clean error messages** - No "Retrying in 25201s" spam
-- ✅ **Atomic storage** - Safe concurrent access to credentials
+- Claude Code installed and authenticated (run `claude` at least once)
+- OpenCode installed
+
+Linux is the primary platform. macOS and Windows should work but are less tested.
+
+## How it works
+
+Reads OAuth tokens from `~/.claude/.credentials.json`, handles the full request lifecycle with proper transforms and retry logic. Syncs credentials to OpenCode's `auth.json` as fallback. Refreshes tokens automatically when near expiry.
 
 ## Installation
 
-```bash
-npm install opencode-anthropic-dark-auth
-```
-
-Or use directly in `opencode.json`:
+Add the plugin to `~/.config/opencode/opencode.json`:
 
 ```json
 {
-  "plugin": [
-    "opencode-anthropic-dark-auth@latest"
-  ]
+  "plugin": ["opencode-anthropic-dark-auth@latest"]
 }
 ```
 
+The `@latest` tag ensures OpenCode always pulls the newest version on startup.
+
 ## Usage
 
-### First Login
+Just run OpenCode. The plugin handles auth automatically — it reads your Claude Code credentials and refreshes them in the background.
 
-1. Restart OpenCode
-2. Click "Login with Claude Pro/Max" for Anthropic provider
-3. Authorize in browser
-4. Done! Token refreshes automatically
+## Credential sources
 
-### Multiple Accounts
+The plugin checks these in order:
 
-Add more accounts to rotate when hitting rate limits:
+1. `~/.claude/.credentials.json` (Claude Code)
+2. `~/.local/share/opencode/auth.json` (OpenCode fallback)
 
-1. Click "Login with Claude Pro/Max" again
-2. Authorize with a different account
-3. Accounts rotate automatically on rate limit
+## Troubleshooting
 
-### Storage
+| Problem | Solution |
+|---------|----------|
+| "Credentials not found" | Run `claude` to authenticate with Claude Code first |
+| "Token expired and refresh failed" | Re-authenticate by running `claude` |
+| Not working | Ensure `~/.claude/.credentials.json` exists |
 
-Accounts are stored in:
-- `~/.config/opencode/dark-auth-accounts.json`
-
-## Configuration
-
-Default configuration (can be customized):
-
-- **Proactive refresh**: 1 hour before token expiry
-- **Max retry delay**: 30 seconds
-- **Credentials cache TTL**: 30 seconds
+Debug logs: `~/.local/share/opencode/dark-auth.log`
 
 ## Development
 
@@ -72,6 +61,10 @@ npm run dev
 # Clean
 npm run clean
 ```
+
+## Disclaimer
+
+This plugin uses Claude Code's OAuth credentials to authenticate with Anthropic's API. Anthropic's Terms of Service state that Claude Pro/Max subscription tokens should only be used with official Anthropic clients. This plugin exists as a community workaround and may stop working if Anthropic changes their OAuth infrastructure. Use at your own discretion.
 
 ## License
 

@@ -23,6 +23,7 @@ import {
   importFromAuthJson,
   logToFile,
 } from "./storage.js";
+import { transformBody, transformResponseStream } from "./transforms";
 import {
   getCachedCredentials,
   refreshIfNeeded,
@@ -281,81 +282,86 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
               if (!headers.has(key)) headers.set(key, value);
             }
 
-            // Make the request
-            let response = await fetch(requestUrl, { ...init, headers });
-            
-            // Log non-200 responses for debugging
-            if (response.status !== 200) {
-              const cloned = response.clone();
-              const body = await cloned.text().catch(() => "");
-              const logMsg = `Response ${response.status}: ${body.substring(0, 500)}`;
-              logToFile(`[dark-auth] ${logMsg}`);
-              console.log(`[dark-auth] ${logMsg}`);
-            }
+            // Transform body (critical for OAuth - adds billing header, splits system entries)
+            const transformedBody = transformBody(init?.body);
 
-            // ── 401 handler (our fix) ──
-            // Token invalidated (e.g. running `claude` in terminal revoked
-            // our refresh token). Invalidate cache, force refresh, retry once.
-            if (response.status === 401) {
-              logToFile("[dark-auth] 401 detected, forcing token refresh");
-              console.log("[dark-auth] 401 detected, forcing token refresh");
+            // ── Retry loop (matching fix plugin behavior) ──
+            const MAX_RETRIES = 3;
+            const MAX_RETRY_DELAY_MS = 30_000;
+            let response: Response | null = null;
 
-              invalidateCache(account.id);
-              const refreshed = await refreshIfNeeded(account, true);
+            for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+              response = await fetch(requestUrl, { ...init, body: transformedBody, headers });
 
-              if (refreshed) {
-                await persistOpenCodeAuth(
-                  refreshed.refreshToken,
-                  refreshed.accessToken,
-                  refreshed.expiresAt,
-                );
-                syncAuthJson(refreshed);
-                headers.set("authorization", `Bearer ${refreshed.accessToken}`);
-                response = await fetch(requestUrl, { ...init, headers });
-              } else {
-                throw new Error(
-                  "[dark-auth] Token refresh failed after 401. Run login to re-authenticate.",
-                );
-              }
-            }
-
-            // ── 429 handler (our fix) ──
-            // Rate limited. If retry-after > 30s, throw immediately
-            // instead of "Retrying in 25201s".
-            if (response.status === 429) {
-              const retryAfter = response.headers.get("retry-after");
-              const retryMs = retryAfter
-                ? parseInt(retryAfter, 10) * 1000
-                : 60_000;
-
-              const msg = `Rate limited (retry after ${Math.round(retryMs / 1000)}s)`;
-              logToFile(`[dark-auth] ${msg}`, { retryAfter, retryMs });
-              console.log(`[dark-auth] ${msg}`);
-
-              // Long cooldown: throw clear error
-              if (retryMs > 30_000) {
-                const waitMins = Math.ceil(retryMs / 60000);
-                throw new Error(
-                  `[dark-auth] Anthropic rate limit exceeded. Resets in ~${waitMins}min. ` +
-                    (storage.accounts.length > 1
-                      ? "Auto-switching to next account..."
-                      : "Add more accounts for automatic rotation."),
-                );
+              // Log non-200 responses for debugging
+              if (response.status !== 200) {
+                const cloned = response.clone();
+                const body = await cloned.text().catch(() => "");
+                const logMsg = `Response ${response.status} (attempt ${attempt + 1}): ${body.substring(0, 500)}`;
+                logToFile(`[dark-auth] ${logMsg}`);
+                console.log(`[dark-auth] ${logMsg}`);
               }
 
-              // Short cooldown: try next account
-              const nextAccount = handleRateLimit(account.id, retryMs);
-              if (nextAccount) {
-                const nextCreds = await getCachedCredentials(nextAccount.id);
-                if (nextCreds) {
-                  console.log("[dark-auth] Switching to next account");
-                  headers.set("authorization", `Bearer ${nextCreds.accessToken}`);
-                  response = await fetch(requestUrl, { ...init, headers });
+              // ── 401 handler ──
+              if (response.status === 401 && attempt < MAX_RETRIES - 1) {
+                logToFile("[dark-auth] 401 detected, forcing token refresh");
+                console.log("[dark-auth] 401 detected, forcing token refresh");
+
+                invalidateCache(account.id);
+                const refreshed = await refreshIfNeeded(account, true);
+
+                if (refreshed) {
+                  await persistOpenCodeAuth(
+                    refreshed.refreshToken,
+                    refreshed.accessToken,
+                    refreshed.expiresAt,
+                  );
+                  syncAuthJson(refreshed);
+                  headers.set("authorization", `Bearer ${refreshed.accessToken}`);
+                  continue; // Retry with new token
+                } else {
+                  throw new Error(
+                    "[dark-auth] Token refresh failed after 401. Run login to re-authenticate.",
+                  );
                 }
               }
+
+              // ── 429 handler ──
+              if ((response.status === 429 || response.status === 529) && attempt < MAX_RETRIES - 1) {
+                const retryAfter = response.headers.get("retry-after");
+                const parsed = retryAfter ? parseInt(retryAfter, 10) : NaN;
+                const delayMs = Number.isNaN(parsed) ? (attempt + 1) * 2000 : parsed * 1000;
+
+                const msg = `Rate limited (retry after ${Math.round(delayMs / 1000)}s, attempt ${attempt + 1})`;
+                logToFile(`[dark-auth] ${msg}`, { retryAfter, delayMs });
+                console.log(`[dark-auth] ${msg}`);
+
+                // If delay exceeds cap, throw error immediately
+                if (delayMs > MAX_RETRY_DELAY_MS) {
+                  const waitHours = Math.ceil(delayMs / 3600000);
+                  const waitMsg = waitHours > 1
+                    ? `Resets in ~${waitHours} hours.`
+                    : `Resets in ~${Math.ceil(delayMs / 60000)} minutes.`;
+                  
+                  throw new Error(
+                    `[dark-auth] Anthropic rate limit exceeded. ${waitMsg} ` +
+                    (storage.accounts.length > 1
+                      ? "Add more accounts for automatic rotation."
+                      : "Run \`opencode auth login\` to add another account."),
+                  );
+                }
+
+                // Wait and retry
+                await new Promise((r) => setTimeout(r, delayMs));
+                continue;
+              }
+
+              // Success or non-retryable error
+              break;
             }
 
-            return response;
+            // Transform response stream (strips tool prefix, handles SSE correctly)
+            return transformResponseStream(response!);
           },
         };
       },

@@ -1,0 +1,11 @@
+src/
+node_modules/
+*.log
+*.tgz
+.DS_Store
+.git/
+.gitignore
+.memory-project
+tsconfig.json
+.vscode/
+.idea/

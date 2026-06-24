@@ -1,7 +1,7 @@
 {
   "name": "opencode-anthropic-dark-auth",
   "version": "1.0.0",
-  "description": "Anthropic OAuth authentication plugin for OpenCode with multi-account support and proactive token refresh",
+  "description": "OpenCode plugin that uses your Claude Code credentials — no separate login needed.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -19,21 +19,34 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
   },
   "keywords": [
-    "opencode",
     "anthropic",
-    "claude",
-    "oauth",
     "auth",
-    "plugin",
-    "multi-account"
+    "claude",
+    "opencode",
+    "plugin"
   ],
-  "author": "DarkRed",
+  "author": {
+    "name": "DarkRed",
+    "url": "https://github.com/JDis03"
+  },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JDis03/opencode-anthropic-dark-auth.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JDis03/opencode-anthropic-dark-auth/issues"
+  },
+  "homepage": "https://github.com/JDis03/opencode-anthropic-dark-auth#readme",
   "engines": {
     "node": ">=18.0.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=0.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
