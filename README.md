@@ -41,7 +41,7 @@ The plugin checks these in order:
 | Problem | Solution |
 |---------|----------|
 | "Credentials not found" | Run `claude` to authenticate with Claude Code first |
-| "Token expired and refresh failed" | Re-authenticate by running `claude` |
+| "Token expired and refresh failed" | Re-authenticate `fixed`|
 | Not working | Ensure `~/.claude/.credentials.json` exists |
 
 Debug logs: `~/.local/share/opencode/dark-auth.log`
