@@ -1,7 +1,157 @@
 // @ts-nocheck
 import { buildBillingHeaderValue } from "./signing.js";
-import { config, getModelOverride } from "./model-config.js";
+import { config, getModelOverride, CHARS_PER_TOKEN } from "./model-config.js";
 const TOOL_PREFIX = "mcp_";
+
+// ─── Token estimation ─────────────────────────────────────────────────────────
+
+/**
+ * Debug: inspect the request body to see compaction state.
+ * Logs message count, presence of "What did we do so far?" (compaction mark),
+ * and total text length in messages.
+ */
+export function debugCompactionState(body, logFn) {
+    if (!body || typeof body !== "string") return;
+    try {
+        const parsed = JSON.parse(body);
+        const msgCount = parsed.messages?.length ?? 0;
+        let totalTextChars = 0;
+        let hasCompactionQuestion = false;
+        if (Array.isArray(parsed.messages)) {
+            for (const msg of parsed.messages) {
+                if (typeof msg.content === "string") {
+                    totalTextChars += msg.content.length;
+                    if (msg.content.includes("What did we do so far?")) hasCompactionQuestion = true;
+                } else if (Array.isArray(msg.content)) {
+                    for (const block of msg.content) {
+                        if (block.type === "text") {
+                            totalTextChars += (block.text ?? "").length;
+                            if ((block.text ?? "").includes("What did we do so far?")) hasCompactionQuestion = true;
+                        }
+                    }
+                }
+            }
+        }
+        const estimated = Math.ceil(totalTextChars / CHARS_PER_TOKEN);
+        logFn(
+            `[dark-auth] COMPACTION DEBUG: ${msgCount} messages, ` +
+            `~${(estimated/1000).toFixed(0)}k chars in text, ` +
+            `compaction_mark="${hasCompactionQuestion}", ` +
+            `system_entries=${(parsed.system?.length ?? 0)}`
+        );
+    } catch { /* ignore parse errors */ }
+}
+
+/**
+ * Rough token count from a raw JSON request body.
+ * Counts chars in system entries, message text blocks, tool results, and
+ * tool_use inputs, then divides by CHARS_PER_TOKEN.
+ *
+ * Intentionally conservative (3.5 chars/token instead of ~4) so we activate
+ * the long-context beta slightly early rather than slightly late.
+ */
+export function estimateBodyTokens(body) {
+    if (!body || typeof body !== "string") return 0;
+    try {
+        const parsed = JSON.parse(body);
+        let chars = 0;
+        // System entries
+        if (Array.isArray(parsed.system)) {
+            for (const e of parsed.system) {
+                if (e.type === "text" && e.text) chars += e.text.length;
+            }
+        } else if (typeof parsed.system === "string") {
+            chars += parsed.system.length;
+        }
+        // Messages
+        if (Array.isArray(parsed.messages)) {
+            for (const msg of parsed.messages) {
+                if (typeof msg.content === "string") {
+                    chars += msg.content.length;
+                } else if (Array.isArray(msg.content)) {
+                    for (const block of msg.content) {
+                        if (block.type === "text") {
+                            chars += (block.text ?? "").length;
+                        } else if (block.type === "tool_result") {
+                            const c = block.content;
+                            if (typeof c === "string") {
+                                chars += c.length;
+                            } else if (Array.isArray(c)) {
+                                for (const part of c) {
+                                    if (part.type === "text") chars += (part.text ?? "").length;
+                                }
+                            }
+                        } else if (block.type === "tool_use") {
+                            chars += JSON.stringify(block.input ?? {}).length;
+                        }
+                    }
+                }
+            }
+        }
+        return Math.ceil(chars / CHARS_PER_TOKEN);
+    } catch {
+        // Fallback: whole body length (will overestimate, but safe)
+        return Math.ceil(body.length / CHARS_PER_TOKEN);
+    }
+}
+/**
+ * Anthropic's tool `input_schema` rejects oneOf/anyOf/allOf at the top level
+ * (nested occurrences inside properties are fine). Some MCP servers emit
+ * schemas for union/discriminated-union inputs with the combinator at the
+ * root, which causes every request carrying that tool to 400 out.
+ *
+ * Fix in place: merge all branches into a single object schema (union of
+ * properties, keep required only where every branch agrees) so Claude still
+ * sees the shape of each variant, just flattened.
+ *
+ * NOT lossy on property-name collisions: if two branches declare the same
+ * property with different sub-schemas, they are combined into a nested
+ * `anyOf` for that property instead of one silently overwriting the other
+ * (the previous behaviour via Object.assign).
+ */
+export function sanitizeInputSchema(schema) {
+    if (!schema || typeof schema !== "object") return schema;
+    const combinatorKey = ["oneOf", "anyOf", "allOf"].find((k) => Array.isArray(schema[k]));
+    if (!combinatorKey) return schema;
+    const branches = schema[combinatorKey].filter((b) => b && typeof b === "object");
+    const properties = {};
+    let requiredSets = [];
+    for (const branch of branches) {
+        if (branch.properties && typeof branch.properties === "object") {
+            for (const [key, propSchema] of Object.entries(branch.properties)) {
+                if (!(key in properties)) {
+                    properties[key] = propSchema;
+                } else if (JSON.stringify(properties[key]) !== JSON.stringify(propSchema)) {
+                    // Collision with a differing sub-schema: preserve both
+                    // variants instead of overwriting one silently.
+                    const existing = properties[key];
+                    const variants = Array.isArray(existing.anyOf) ? existing.anyOf : [existing];
+                    const alreadyPresent = variants.some(
+                        (v) => JSON.stringify(v) === JSON.stringify(propSchema),
+                    );
+                    properties[key] = alreadyPresent
+                        ? existing
+                        : { anyOf: [...variants, propSchema] };
+                }
+            }
+        }
+        if (Array.isArray(branch.required)) {
+            requiredSets.push(branch.required);
+        }
+    }
+    const required = requiredSets.length > 0
+        ? requiredSets.reduce((a, b) => a.filter((k) => b.includes(k)))
+        : undefined;
+    const { [combinatorKey]: _dropped, ...rest } = schema;
+    const merged = {
+        ...rest,
+        type: "object",
+        properties,
+    };
+    if (required && required.length > 0) merged.required = required;
+    return merged;
+}
+
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
  * Claude Code uses PascalCase tool names (e.g. mcp_Bash, mcp_Read);
@@ -178,6 +328,9 @@ export function transformBody(body) {
             parsed.tools = parsed.tools.map((tool) => ({
                 ...tool,
                 name: tool.name ? prefixName(tool.name) : tool.name,
+                ...(tool.input_schema
+                    ? { input_schema: sanitizeInputSchema(tool.input_schema) }
+                    : {}),
             }));
         }
         if (Array.isArray(parsed.messages)) {
@@ -269,4 +422,3 @@ export function transformResponseStream(response) {
         headers: response.headers,
     });
 }
-//# sourceMappingURL=transforms.js.map

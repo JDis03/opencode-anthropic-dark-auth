@@ -178,14 +178,37 @@ export function importFromAuthJson(): Account | null {
   }
 }
 
+// In-memory cache for the accounts file. getActiveAccount()/loadAccounts()
+// sit in the hot path of every outgoing request (index.ts fetch()), so a
+// short TTL avoids a synchronous disk read + JSON.parse per request while
+// staying fresh across explicit mutations (invalidated in saveAccounts()).
+const STORAGE_CACHE_TTL_MS = 2_000;
+let storageCache: AccountStorage | null = null;
+let storageCacheAt = 0;
+
+function invalidateStorageCache(): void {
+  storageCache = null;
+}
+
 /**
  * Load accounts from disk
  */
 export function loadAccounts(): AccountStorage {
+  const now = Date.now();
+  if (storageCache && now - storageCacheAt < STORAGE_CACHE_TTL_MS) {
+    // Return a deep clone so callers mutating the result in place (a common
+    // pattern here, e.g. refreshIfNeeded/upsertAccount) can't corrupt the
+    // cached copy without going through saveAccounts().
+    return JSON.parse(JSON.stringify(storageCache)) as AccountStorage;
+  }
+
   const path = getStoragePath();
-  
+
   if (!existsSync(path)) {
-    return { ...DEFAULT_STORAGE };
+    const empty = { ...DEFAULT_STORAGE };
+    storageCache = empty;
+    storageCacheAt = now;
+    return { ...empty };
   }
 
   try {
@@ -195,7 +218,10 @@ export function loadAccounts(): AccountStorage {
     // Validate structure
     if (!data.version || !Array.isArray(data.accounts)) {
       console.warn("[dark-auth] Invalid storage format, resetting");
-      return { ...DEFAULT_STORAGE };
+      const empty = { ...DEFAULT_STORAGE };
+      storageCache = empty;
+      storageCacheAt = now;
+      return { ...empty };
     }
 
     // Clean up expired rate limits
@@ -207,6 +233,8 @@ export function loadAccounts(): AccountStorage {
       return account;
     });
 
+    storageCache = data;
+    storageCacheAt = now;
     return data;
   } catch (error) {
     console.error("[dark-auth] Failed to load accounts:", error);
@@ -233,6 +261,7 @@ export function saveAccounts(storage: AccountStorage): void {
   try {
     writeFileSync(tempPath, content, { encoding: "utf-8", mode: 0o600 });
     renameSync(tempPath, path);
+    invalidateStorageCache();
   } catch (error) {
     console.error("[dark-auth] Failed to save accounts:", error);
     throw error;

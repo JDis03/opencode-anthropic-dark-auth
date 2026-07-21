@@ -23,7 +23,8 @@ import {
   importFromAuthJson,
   logToFile,
 } from "./storage.js";
-import { transformBody, transformResponseStream } from "./transforms";
+import { transformBody, transformResponseStream, estimateBodyTokens, debugCompactionState } from "./transforms";
+import { config, TOKEN_THRESHOLDS, getModelCost } from "./model-config";
 import {
   getCachedCredentials,
   refreshIfNeeded,
@@ -36,6 +37,12 @@ const PROACTIVE_REFRESH_THRESHOLD = 60 * 60 * 1000;
 
 // Stable per-process session ID, matching Claude Code's X-Claude-Code-Session-Id
 const sessionId = randomUUID();
+
+// ─── In-memory session token tracking (resets on process restart) ─────────────
+// Tracks estimated input tokens and request count to give feedback on
+// how much of the $20/mo programmatic credit pool is being consumed.
+let sessionInputTokens = 0;
+let sessionRequestCount = 0;
 
 export default async function darkAuthPlugin({ client }: { client: any }) {
   logToFile("[dark-auth] Initializing plugin");
@@ -244,11 +251,13 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
             
             // Merge anthropic-beta values
             const incomingBeta = headers.get("anthropic-beta") ?? "";
+            // Use config.baseBetas from model-config.ts — these include the
+            // CRITICAL claude-code-20250219 that tells Anthropic this is a
+            // Claude Code OAuth request so subscription billing/usage credits apply.
             const baseBetas = [
-              "oauth-2025-04-20",
+              ...config.baseBetas,
               "files-api-2025-04-14",
-              "prompt-caching-scope-2026-01-05",
-              "extended-cache-ttl-2025-04-11"
+              "extended-cache-ttl-2025-04-11",
             ];
             const mergedBetas = [
               ...new Set([
@@ -284,6 +293,74 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
 
             // Transform body (critical for OAuth - adds billing header, splits system entries)
             const transformedBody = transformBody(init?.body);
+
+            // Context size tracking, warnings & long-context beta
+            const rawBody = typeof init?.body === "string" ? init.body : "";
+            const estimatedTokens = estimateBodyTokens(rawBody);
+
+            // Debug: log compaction state (message count, has "What did we do so far?")
+            debugCompactionState(rawBody, logToFile);
+
+            // Extract model ID for cost calculation
+            const requestModelId: string = (() => {
+              try { return (JSON.parse(rawBody) as any).model ?? ""; }
+              catch { return ""; }
+            })();
+            const modelCost = getModelCost(requestModelId);
+            const inputCostPerMTok = (modelCost as any)?.input ?? 3.0; // fallback: Sonnet rate
+
+            // Accumulate session totals (only once, outside the retry loop)
+            sessionInputTokens += estimatedTokens;
+            sessionRequestCount++;
+
+            // Warn at different thresholds
+            if (estimatedTokens > TOKEN_THRESHOLDS.WARN_CRITICAL) {
+              const usd = ((estimatedTokens / 1_000_000) * inputCostPerMTok).toFixed(3);
+              const msg =
+                `[dark-auth] 🔴 CRITICAL context: ~${Math.round(estimatedTokens / 1000)}k tokens` +
+                ` (~$${usd} from your $20/mo programmatic credits)`;
+              console.warn(msg);
+              logToFile(msg);
+            } else if (estimatedTokens > TOKEN_THRESHOLDS.WARN_MODERATE) {
+              const usd = ((estimatedTokens / 1_000_000) * inputCostPerMTok).toFixed(3);
+              const msg =
+                `[dark-auth] 🟡 HIGH context: ~${Math.round(estimatedTokens / 1000)}k tokens` +
+                ` (~$${usd} from programmatic credits)`;
+              console.warn(msg);
+              logToFile(msg);
+            } else if (estimatedTokens > TOKEN_THRESHOLDS.WARN_INFO) {
+              const msg =
+                `[dark-auth] 🔵 Large context: ~${Math.round(estimatedTokens / 1000)}k tokens` +
+                ` — entering extra-credit territory`;
+              console.log(msg);
+              logToFile(msg);
+            }
+
+            // Log session summary every 5 requests (to file only, not console)
+            if (sessionRequestCount % 5 === 0) {
+              const sessionUSD = ((sessionInputTokens / 1_000_000) * 3.0).toFixed(2);
+              logToFile(
+                `[dark-auth] Session snapshot: ${sessionRequestCount} requests,` +
+                ` ~${Math.round(sessionInputTokens / 1000)}k input tokens est.,` +
+                ` ~$${sessionUSD} USD est. (vs $20/mo credit pool)`,
+              );
+            }
+
+            // Auto-enable long-context betas so Anthropic accepts >100k-token requests
+            if (
+              estimatedTokens > TOKEN_THRESHOLDS.LONG_CONTEXT_BETA
+            ) {
+              for (const beta of config.longContextBetas) {
+                if (!mergedBetas.includes(beta)) {
+                  mergedBetas.push(beta);
+                }
+              }
+              headers.set("anthropic-beta", mergedBetas.join(","));
+              logToFile(
+                `[dark-auth] Long-context betas activated: ${config.longContextBetas.join(", ")}` +
+                ` (~${Math.round(estimatedTokens / 1000)}k tokens, model: ${requestModelId})`,
+              );
+            }
 
             // ── Retry loop (matching fix plugin behavior) ──
             const MAX_RETRIES = 3;
@@ -336,6 +413,26 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
                 logToFile(`[dark-auth] ${msg}`, { retryAfter, delayMs });
                 console.log(`[dark-auth] ${msg}`);
 
+                // Mark this account rate-limited and try to rotate to another
+                // enabled, non-rate-limited account before waiting out the delay.
+                const nextAccount = handleRateLimit(account.id, delayMs);
+                if (nextAccount) {
+                  logToFile(
+                    `[dark-auth] Rotating to account ${nextAccount.id} after rate limit`,
+                  );
+                  console.log(
+                    `[dark-auth] Switched to another account after rate limit`,
+                  );
+                  invalidateCache(nextAccount.id);
+                  const nextCredentials = await getCachedCredentials(nextAccount.id);
+                  if (nextCredentials) {
+                    headers.set("authorization", `Bearer ${nextCredentials.accessToken}`);
+                    continue; // Retry immediately with the new account, no wait
+                  }
+                  // Fall through to wait-and-retry on the original account
+                  // if the rotated-to account's credentials couldn't be loaded.
+                }
+
                 // If delay exceeds cap, throw error immediately
                 if (delayMs > MAX_RETRY_DELAY_MS) {
                   const waitHours = Math.ceil(delayMs / 3600000);
@@ -358,6 +455,31 @@ export default async function darkAuthPlugin({ client }: { client: any }) {
 
               // Success or non-retryable error
               break;
+            }
+
+            // ── Rate limit / usage header snapshot (to file only) ────────────────
+            {
+              const snap: Record<string, string> = {};
+              for (const h of [
+                "anthropic-ratelimit-requests-remaining",
+                "anthropic-ratelimit-tokens-remaining",
+                "anthropic-ratelimit-input-tokens-remaining",
+              ]) {
+                const v = response!.headers.get(h);
+                if (v !== null) snap[h] = v;
+              }
+              if (Object.keys(snap).length > 0) {
+                logToFile("[dark-auth] Rate limit snapshot", snap);
+                const tokensLeft = parseInt(
+                  snap["anthropic-ratelimit-tokens-remaining"] ?? "9999999",
+                  10,
+                );
+                if (!isNaN(tokensLeft) && tokensLeft < 10_000) {
+                  console.warn(
+                    `[dark-auth] ⚠️  Rate limit low: only ${tokensLeft} tokens remaining in window`,
+                  );
+                }
+              }
             }
 
             // Transform response stream (strips tool prefix, handles SSE correctly)

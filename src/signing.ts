@@ -53,4 +53,3 @@ export function buildBillingHeaderValue(messages, version, entrypoint) {
         `cc_entrypoint=${entrypoint}; ` +
         `cch=${cch};`);
 }
-//# sourceMappingURL=signing.js.map
