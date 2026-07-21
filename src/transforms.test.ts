@@ -163,6 +163,99 @@ describe("sanitizeInputSchema — regression: was lossy on property collisions",
     expect(payload.oneOf).toBeUndefined();
   });
 
+  it("regression: mixed-type oneOf at the root does not just get renamed to a root-level anyOf", () => {
+    // Renaming oneOf/allOf -> anyOf at the root is not a fix — Anthropic
+    // rejects anyOf at the top level exactly like oneOf/allOf. When branches
+    // aren't all object schemas, the union must be wrapped so no combinator
+    // key survives at the root.
+    const schema = {
+      oneOf: [
+        { type: "string" },
+        { type: "number" },
+      ],
+    };
+
+    const result = sanitizeInputSchema(schema);
+
+    expect(result.oneOf).toBeUndefined();
+    expect(result.anyOf).toBeUndefined();
+    expect(result.allOf).toBeUndefined();
+    expect(result.type).toBe("object");
+    expect(result.properties.value.anyOf).toContainEqual({ type: "string" });
+    expect(result.properties.value.anyOf).toContainEqual({ type: "number" });
+  });
+
+  it("regression: does not silently drop a branch that is itself a bare combinator", () => {
+    // A branch with no "type"/"properties" of its own (just a nested oneOf)
+    // used to be misclassified as an empty object branch, silently losing
+    // its entire contents in the merge.
+    const schema = {
+      oneOf: [
+        { oneOf: [
+          { type: "object", properties: { a: { type: "string" } }, required: ["a"] },
+          { type: "object", properties: { b: { type: "number" } }, required: ["b"] },
+        ] },
+        { type: "object", properties: { c: { type: "string" } } },
+      ],
+    };
+
+    const result = sanitizeInputSchema(schema);
+
+    expect(result.properties.a).toEqual({ type: "string" });
+    expect(result.properties.b).toEqual({ type: "number" });
+    expect(result.properties.c).toEqual({ type: "string" });
+  });
+
+  it("regression: required is not forced when only some branches of a union declare it", () => {
+    // A branch that omits "required" entirely requires nothing — it should
+    // count as an empty set in the intersection, not be skipped, which
+    // previously let a lone branch's "required" win by default.
+    const schema = {
+      oneOf: [
+        { type: "object", properties: { a: { type: "string" } }, required: ["a"] },
+        { type: "object", properties: { a: { type: "string" } } },
+      ],
+    };
+
+    const result = sanitizeInputSchema(schema);
+
+    expect(result.required).toBeUndefined();
+  });
+
+  it("regression: allOf uses intersection semantics, not union semantics", () => {
+    // allOf means every branch's constraints hold simultaneously, so
+    // required fields should union (not intersect), and colliding
+    // properties should combine via allOf (not anyOf).
+    const schema = {
+      allOf: [
+        { type: "object", properties: { a: { type: "string" } }, required: ["a"] },
+        { type: "object", properties: { b: { type: "number" } }, required: ["b"] },
+      ],
+    };
+
+    const result = sanitizeInputSchema(schema);
+
+    expect(result.required).toEqual(expect.arrayContaining(["a", "b"]));
+    expect(result.required).toHaveLength(2);
+    expect(result.properties.a).toEqual({ type: "string" });
+    expect(result.properties.b).toEqual({ type: "number" });
+  });
+
+  it("regression: allOf collisions combine via allOf, not anyOf", () => {
+    const schema = {
+      allOf: [
+        { type: "object", properties: { a: { type: "string", minLength: 1 } } },
+        { type: "object", properties: { a: { type: "string", maxLength: 10 } } },
+      ],
+    };
+
+    const result = sanitizeInputSchema(schema);
+
+    expect(result.properties.a.allOf).toContainEqual({ type: "string", minLength: 1 });
+    expect(result.properties.a.allOf).toContainEqual({ type: "string", maxLength: 10 });
+    expect(result.properties.a.anyOf).toBeUndefined();
+  });
+
   it("does not mutate the original schema object", () => {
     const original = {
       type: "object",

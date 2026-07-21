@@ -123,17 +123,27 @@ function deepClone(value) {
     return JSON.parse(JSON.stringify(value));
 }
 
-function flattenCombinatorsAtNode(node) {
+function flattenCombinatorsAtNode(node, isRoot) {
     const combinatorKey = COMBINATOR_KEYS.find((k) => Array.isArray(node[k]));
     if (!combinatorKey) return node;
-    const branches = node[combinatorKey].filter((b) => b && typeof b === "object");
+    // Resolve each branch fully first. Otherwise a branch that is itself
+    // just a bare combinator (e.g. { oneOf: [...] } with no "type" or
+    // "properties" of its own) is invisible to the classification/merge
+    // below and its whole content silently disappears.
+    const branches = node[combinatorKey]
+        .filter((b) => b && typeof b === "object")
+        .map((b) => walk(b));
+
+    // allOf is an intersection — every branch's constraints hold at once —
+    // while oneOf/anyOf are a union — exactly one/at least one branch
+    // applies. They need opposite merge rules for `required` and for
+    // colliding properties below.
+    const isIntersection = combinatorKey === "allOf";
+    const comboKey = isIntersection ? "allOf" : "anyOf";
 
     // Mixed-shape case: branches are not all object schemas (e.g. one is
-    // { type: "string" }, another is { type: "number" }). Anthropic's tool
-    // validator only accepts the root as `type: object`, so we keep the
-    // entire combinator as-is under `anyOf` and just rename the disallowed
-    // key — the validator rejects `oneOf`/`allOf`/`anyOf` only at the root,
-    // and a nested `anyOf` is fine.
+    // { type: "string" }, another is { type: "number" }). A nested `anyOf`
+    // is fine, so for non-root nodes we just rename the disallowed key.
     const allObjects = branches.length > 0 && branches.every(
         (b) => b.type === undefined || b.type === "object",
     );
@@ -144,12 +154,36 @@ function flattenCombinatorsAtNode(node) {
         for (const v of variants) {
             if (!seen.has(v)) { seen.add(v); deduped.push(v); }
         }
+        const parsedVariants = deduped.map((v) => JSON.parse(v));
         const { [combinatorKey]: dropped, ...rest } = node;
-        // Convert oneOf/allOf -> anyOf for consistency (Anthropic accepts anyOf).
-        return { ...rest, anyOf: deduped.map((v) => JSON.parse(v)) };
+        if (isRoot) {
+            // The root can't carry oneOf/allOf/anyOf at all (renaming to
+            // anyOf still leaves a combinator at the top level, which
+            // Anthropic rejects the same way). Tool arguments are always a
+            // JSON object, so wrap the union under a synthetic property
+            // instead of leaving it at the root.
+            return {
+                ...rest,
+                type: "object",
+                properties: { value: { [comboKey]: parsedVariants } },
+                required: ["value"],
+            };
+        }
+        // Convert oneOf -> anyOf for consistency (Anthropic accepts anyOf);
+        // allOf keeps its own semantics and stays as allOf.
+        return { ...rest, [comboKey]: parsedVariants };
     }
 
-    // Pure object-schema branches: merge properties, deduping collisions.
+    // Pure object-schema branches: merge properties.
+    // - oneOf/anyOf (union): a property collision becomes a nested `anyOf`
+    //   ("either shape is acceptable"); `required` is kept only where every
+    //   branch agrees (intersection) — a branch that omits "required"
+    //   entirely requires nothing, so it correctly zeroes out any field
+    //   that isn't required across every arm of the union.
+    // - allOf (intersection): a property collision must hold for both
+    //   branches at once, so it becomes a nested `allOf` instead; `required`
+    //   is the union of every branch's required fields, since all of them
+    //   apply simultaneously.
     const properties = {};
     const requiredSets = [];
     for (const branch of branches) {
@@ -159,30 +193,28 @@ function flattenCombinatorsAtNode(node) {
                     properties[key] = propSchema;
                 } else if (JSON.stringify(properties[key]) !== JSON.stringify(propSchema)) {
                     const existing = properties[key];
-                    const variants = Array.isArray(existing.anyOf) ? existing.anyOf : [existing];
+                    const variants = Array.isArray(existing[comboKey]) ? existing[comboKey] : [existing];
                     const alreadyPresent = variants.some(
                         (v) => JSON.stringify(v) === JSON.stringify(propSchema),
                     );
                     properties[key] = alreadyPresent
                         ? existing
-                        : { anyOf: [...variants, propSchema] };
+                        : { [comboKey]: [...variants, propSchema] };
                 }
             }
         }
-        if (Array.isArray(branch.required)) {
-            requiredSets.push(branch.required);
-        }
+        requiredSets.push(Array.isArray(branch.required) ? branch.required : []);
     }
-    const required = requiredSets.length > 0
-        ? requiredSets.reduce((a, b) => a.filter((k) => b.includes(k)))
-        : undefined;
+    const required = isIntersection
+        ? [...new Set(requiredSets.flat())]
+        : requiredSets.reduce((a, b) => a.filter((k) => b.includes(k)));
     const { [combinatorKey]: _dropped, ...rest } = node;
     const merged = { ...rest, type: "object", properties };
-    if (required && required.length > 0) merged.required = required;
+    if (required.length > 0) merged.required = required;
     return merged;
 }
 
-function walk(schema) {
+function walk(schema, isRoot = false) {
     if (!schema || typeof schema !== "object") return schema;
     // Flatten combinators at this node if present. Keep iterating because
     // a flattened oneOf/anyOf/allOf produces a fresh object whose
@@ -190,7 +222,7 @@ function walk(schema) {
     let current = schema;
     let guard = 0;
     while (COMBINATOR_KEYS.some((k) => Array.isArray(current[k])) && guard++ < 32) {
-        current = flattenCombinatorsAtNode(current);
+        current = flattenCombinatorsAtNode(current, isRoot);
     }
     // Recurse into properties (object shape).
     if (current.properties && typeof current.properties === "object") {
@@ -215,7 +247,7 @@ function walk(schema) {
 
 export function sanitizeInputSchema(schema) {
     if (!schema || typeof schema !== "object") return schema;
-    return walk(deepClone(schema));
+    return walk(deepClone(schema), true);
 }
 
 /**
