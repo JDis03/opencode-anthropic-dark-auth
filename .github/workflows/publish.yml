@@ -1,0 +1,50 @@
+name: Publish to npm
+
+# Trusted Publisher (OIDC) — no NPM_TOKEN needed. This workflow must be
+# registered in npm's "Trusted Publisher" settings for this package with:
+#   Organization or user: JDis03
+#   Repository:            opencode-anthropic-dark-auth
+#   Workflow filename:     publish.yml
+#
+# Triggers on a GitHub Release being published. To ship a new version:
+#   1. Bump "version" in package.json and commit.
+#   2. Create a GitHub Release with a tag matching the new version (e.g. v1.1.0).
+#   3. This workflow builds, tests, and publishes automatically.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write # required for npm OIDC trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Update npm (OIDC trusted publishing requires npm >= 11.5.1)
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
