@@ -40,7 +40,11 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  // vi.clearAllMocks() only clears call history; implementations stick
+  // around across tests in the same file. vi.resetAllMocks() also wipes
+  // the mock return values, which is what we want between tests that
+  // configure different `loadAccounts`/`refreshToken` return values.
+  vi.resetAllMocks();
   invalidateCache();
 });
 
