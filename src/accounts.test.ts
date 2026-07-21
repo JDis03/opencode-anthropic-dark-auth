@@ -1,17 +1,27 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Account } from "./types.js";
 
+// Shared mutable state hoisted above vi.mock() so each test can change what
+// the mocks return without depending on test ordering or vi.resetAllMocks
+// wiping the implementation between tests. This was failing intermittently
+// on CI: a prior test's mockReturnValue assignment leaked and overshadowed
+// the next test's assignment.
+const mocks = vi.hoisted(() => ({
+  loadAccountsReturn: null as any,
+  refreshTokenReturn: null as any,
+}));
+
 // Mock the disk-backed storage module and the network-backed oauth module
 // so accounts.ts logic (refresh decisions, cache, rotation) is tested in
 // isolation, without touching the filesystem or making real HTTP calls.
 vi.mock("./storage.js", () => ({
-  loadAccounts: vi.fn(),
+  loadAccounts: vi.fn(() => mocks.loadAccountsReturn),
   saveAccounts: vi.fn(),
   getActiveAccount: vi.fn(),
 }));
 
 vi.mock("./oauth.js", () => ({
-  refreshToken: vi.fn(),
+  refreshToken: vi.fn(() => Promise.resolve(mocks.refreshTokenReturn)),
 }));
 
 import { loadAccounts, saveAccounts } from "./storage.js";
@@ -40,11 +50,12 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 }
 
 beforeEach(() => {
-  // vi.clearAllMocks() only clears call history; implementations stick
-  // around across tests in the same file. vi.resetAllMocks() also wipes
-  // the mock return values, which is what we want between tests that
-  // configure different `loadAccounts`/`refreshToken` return values.
-  vi.resetAllMocks();
+  // Reset call history but NOT implementations — the mock implementations
+  // read from the hoisted `mocks` object on every call, so each test just
+  // mutates `mocks.loadAccountsReturn` / `mocks.refreshTokenReturn`.
+  vi.clearAllMocks();
+  mocks.loadAccountsReturn = null;
+  mocks.refreshTokenReturn = null;
   invalidateCache();
 });
 
@@ -64,12 +75,12 @@ describe("refreshIfNeeded", () => {
       refreshToken: "new-refresh",
       expiresAt: Date.now() + 60 * 60 * 1000,
     };
-    (refreshToken as any).mockResolvedValue(refreshed);
-    (loadAccounts as any).mockReturnValue({
+    mocks.refreshTokenReturn = refreshed;
+    mocks.loadAccountsReturn = {
       version: 1,
       accounts: [account],
       activeAccountId: account.id,
-    });
+    };
 
     const result = await refreshIfNeeded(account, true);
 
@@ -92,12 +103,12 @@ describe("refreshIfNeeded", () => {
       refreshToken: "new-refresh",
       expiresAt: Date.now() + 60 * 60 * 1000,
     };
-    (refreshToken as any).mockResolvedValue(refreshed);
-    (loadAccounts as any).mockReturnValue({
+    mocks.refreshTokenReturn = refreshed;
+    mocks.loadAccountsReturn = {
       version: 1,
       accounts: [account],
       activeAccountId: account.id,
-    });
+    };
 
     const result = await refreshIfNeeded(account, false);
 
@@ -107,7 +118,7 @@ describe("refreshIfNeeded", () => {
 
   it("returns null when the underlying OAuth refresh call fails", async () => {
     const account = makeAccount();
-    (refreshToken as any).mockResolvedValue(null);
+    mocks.refreshTokenReturn = null;
 
     const result = await refreshIfNeeded(account, true);
 
@@ -118,7 +129,7 @@ describe("refreshIfNeeded", () => {
 
 describe("getCachedCredentials", () => {
   it("returns null when the account cannot be found", async () => {
-    (loadAccounts as any).mockReturnValue({ version: 1, accounts: [], activeAccountId: null });
+    mocks.loadAccountsReturn = { version: 1, accounts: [], activeAccountId: null };
 
     const result = await getCachedCredentials("missing-id");
 
@@ -127,11 +138,12 @@ describe("getCachedCredentials", () => {
 
   it("serves cached credentials within TTL without calling refreshToken again", async () => {
     const account = makeAccount();
-    (loadAccounts as any).mockReturnValue({
+    mocks.loadAccountsReturn = {
       version: 1,
       accounts: [account],
       activeAccountId: account.id,
-    });
+    };
+    // refreshTokenReturn stays null — token is valid for 1h, no refresh needed.
 
     const first = await getCachedCredentials(account.id);
     const second = await getCachedCredentials(account.id);
@@ -148,11 +160,11 @@ describe("handleRateLimit — 429 rotation (regression: was dead-imported and un
   it("marks the current account rate-limited and rotates to the next available one", () => {
     const rateLimited = makeAccount({ id: "acc-1" });
     const other = makeAccount({ id: "acc-2" });
-    (loadAccounts as any).mockReturnValue({
+    mocks.loadAccountsReturn = {
       version: 1,
       accounts: [rateLimited, other],
       activeAccountId: "acc-1",
-    });
+    };
 
     const next = handleRateLimit("acc-1", 60_000);
 
@@ -165,11 +177,11 @@ describe("handleRateLimit — 429 rotation (regression: was dead-imported and un
 
   it("returns null when no other account is available to rotate to", () => {
     const onlyAccount = makeAccount({ id: "acc-1" });
-    (loadAccounts as any).mockReturnValue({
+    mocks.loadAccountsReturn = {
       version: 1,
       accounts: [onlyAccount],
       activeAccountId: "acc-1",
-    });
+    };
 
     const next = handleRateLimit("acc-1", 60_000);
 
@@ -183,11 +195,11 @@ describe("handleRateLimit — 429 rotation (regression: was dead-imported and un
       id: "acc-3",
       rateLimitedUntil: Date.now() + 30_000,
     });
-    (loadAccounts as any).mockReturnValue({
+    mocks.loadAccountsReturn = {
       version: 1,
       accounts: [rateLimited, disabled, alsoLimited],
       activeAccountId: "acc-1",
-    });
+    };
 
     const next = handleRateLimit("acc-1", 60_000);
 
