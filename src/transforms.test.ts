@@ -39,9 +39,12 @@ describe("estimateBodyTokens", () => {
 });
 
 describe("sanitizeInputSchema — regression: was lossy on property collisions", () => {
-  it("passes through schemas without a root combinator untouched", () => {
+  it("passes through schemas without a root combinator returning an equivalent copy", () => {
     const schema = { type: "object", properties: { a: { type: "string" } } };
-    expect(sanitizeInputSchema(schema)).toBe(schema);
+    const result = sanitizeInputSchema(schema);
+    expect(result).toEqual(schema);
+    // But a fresh object — must not mutate or alias the input.
+    expect(result).not.toBe(schema);
   });
 
   it("flattens oneOf branches into a single object schema", () => {
@@ -103,6 +106,75 @@ describe("sanitizeInputSchema — regression: was lossy on property collisions",
     const result = sanitizeInputSchema(schema);
 
     expect(result.properties.value).toEqual({ type: "string" });
+  });
+
+  it("regression: sanitizes oneOf nested INSIDE a property, not just at the top level", () => {
+    // The original error path: tools.75.custom.input_schema has a root-level
+    // object schema, but one of its properties carries a oneOf — that's also
+    // rejected by Anthropic's validator with the same error message.
+    const schema = {
+      type: "object",
+      properties: {
+        custom: {
+          oneOf: [
+            { type: "string" },
+            { type: "number" },
+          ],
+        },
+      },
+    };
+
+    const result = sanitizeInputSchema(schema);
+
+    // The nested oneOf must be flattened too — no oneOf at any depth.
+    expect(result.properties.custom.oneOf).toBeUndefined();
+    expect(result.properties.custom.anyOf).toBeDefined();
+    expect(result.properties.custom.anyOf).toContainEqual({ type: "string" });
+    expect(result.properties.custom.anyOf).toContainEqual({ type: "number" });
+  });
+
+  it("regression: walks through array items and deeply nested objects", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              payload: {
+                anyOf: [
+                  { type: "string" },
+                  { type: "null" },
+                ],
+              },
+            },
+          },
+        },
+      },
+    };
+
+    const result = sanitizeInputSchema(schema);
+
+    const payload = (result.properties.items as any).items.properties.payload;
+    expect(payload.anyOf).toBeDefined();
+    expect(payload.anyOf).toContainEqual({ type: "string" });
+    expect(payload.anyOf).toContainEqual({ type: "null" });
+    expect(payload.oneOf).toBeUndefined();
+  });
+
+  it("does not mutate the original schema object", () => {
+    const original = {
+      type: "object",
+      properties: {
+        value: { oneOf: [{ type: "string" }, { type: "number" }] },
+      },
+    };
+    const snapshot = JSON.parse(JSON.stringify(original));
+
+    sanitizeInputSchema(original);
+
+    expect(original).toEqual(snapshot);
   });
 });
 

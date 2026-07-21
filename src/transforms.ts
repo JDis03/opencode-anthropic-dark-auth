@@ -108,22 +108,56 @@ export function estimateBodyTokens(body) {
  * property with different sub-schemas, they are combined into a nested
  * `anyOf` for that property instead of one silently overwriting the other
  * (the previous behaviour via Object.assign).
+ *
+ * Recursive: the same prohibition applies at any depth (Anthropic rejects
+ * `oneOf/anyOf/allOf` at any level, not just the root). We walk through
+ * `properties`, `items`, and nested branches to catch occurrences inside
+ * sub-schemas too.
+ *
+ * Immutable on the input: we deep-clone before rewriting so callers that
+ * pass a cached schema don't see it mutated underneath them.
  */
-export function sanitizeInputSchema(schema) {
-    if (!schema || typeof schema !== "object") return schema;
-    const combinatorKey = ["oneOf", "anyOf", "allOf"].find((k) => Array.isArray(schema[k]));
-    if (!combinatorKey) return schema;
-    const branches = schema[combinatorKey].filter((b) => b && typeof b === "object");
+const COMBINATOR_KEYS = ["oneOf", "anyOf", "allOf"];
+
+function deepClone(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+function flattenCombinatorsAtNode(node) {
+    const combinatorKey = COMBINATOR_KEYS.find((k) => Array.isArray(node[k]));
+    if (!combinatorKey) return node;
+    const branches = node[combinatorKey].filter((b) => b && typeof b === "object");
+
+    // Mixed-shape case: branches are not all object schemas (e.g. one is
+    // { type: "string" }, another is { type: "number" }). Anthropic's tool
+    // validator only accepts the root as `type: object`, so we keep the
+    // entire combinator as-is under `anyOf` and just rename the disallowed
+    // key — the validator rejects `oneOf`/`allOf`/`anyOf` only at the root,
+    // and a nested `anyOf` is fine.
+    const allObjects = branches.length > 0 && branches.every(
+        (b) => b.type === undefined || b.type === "object",
+    );
+    if (!allObjects) {
+        const variants = branches.map((b) => JSON.stringify(b));
+        const deduped = [];
+        const seen = new Set();
+        for (const v of variants) {
+            if (!seen.has(v)) { seen.add(v); deduped.push(v); }
+        }
+        const { [combinatorKey]: dropped, ...rest } = node;
+        // Convert oneOf/allOf -> anyOf for consistency (Anthropic accepts anyOf).
+        return { ...rest, anyOf: deduped.map((v) => JSON.parse(v)) };
+    }
+
+    // Pure object-schema branches: merge properties, deduping collisions.
     const properties = {};
-    let requiredSets = [];
+    const requiredSets = [];
     for (const branch of branches) {
         if (branch.properties && typeof branch.properties === "object") {
             for (const [key, propSchema] of Object.entries(branch.properties)) {
                 if (!(key in properties)) {
                     properties[key] = propSchema;
                 } else if (JSON.stringify(properties[key]) !== JSON.stringify(propSchema)) {
-                    // Collision with a differing sub-schema: preserve both
-                    // variants instead of overwriting one silently.
                     const existing = properties[key];
                     const variants = Array.isArray(existing.anyOf) ? existing.anyOf : [existing];
                     const alreadyPresent = variants.some(
@@ -142,14 +176,46 @@ export function sanitizeInputSchema(schema) {
     const required = requiredSets.length > 0
         ? requiredSets.reduce((a, b) => a.filter((k) => b.includes(k)))
         : undefined;
-    const { [combinatorKey]: _dropped, ...rest } = schema;
-    const merged = {
-        ...rest,
-        type: "object",
-        properties,
-    };
+    const { [combinatorKey]: _dropped, ...rest } = node;
+    const merged = { ...rest, type: "object", properties };
     if (required && required.length > 0) merged.required = required;
     return merged;
+}
+
+function walk(schema) {
+    if (!schema || typeof schema !== "object") return schema;
+    // Flatten combinators at this node if present. Keep iterating because
+    // a flattened oneOf/anyOf/allOf produces a fresh object whose
+    // properties can themselves contain combinators.
+    let current = schema;
+    let guard = 0;
+    while (COMBINATOR_KEYS.some((k) => Array.isArray(current[k])) && guard++ < 32) {
+        current = flattenCombinatorsAtNode(current);
+    }
+    // Recurse into properties (object shape).
+    if (current.properties && typeof current.properties === "object") {
+        const next = { ...current, properties: {} };
+        for (const [key, value] of Object.entries(current.properties)) {
+            next.properties[key] = walk(value);
+        }
+        current = next;
+    }
+    // Recurse into array items.
+    if (current.items) {
+        current = { ...current, items: walk(current.items) };
+    }
+    // Defensive: if any combinator survived, recurse into its branches.
+    for (const key of COMBINATOR_KEYS) {
+        if (Array.isArray(current[key])) {
+            current = { ...current, [key]: current[key].map((b) => walk(b)) };
+        }
+    }
+    return current;
+}
+
+export function sanitizeInputSchema(schema) {
+    if (!schema || typeof schema !== "object") return schema;
+    return walk(deepClone(schema));
 }
 
 /**

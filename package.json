@@ -1,6 +1,6 @@
 {
   "name": "opencode-anthropic-dark-auth",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "OpenCode plugin that uses your Claude Code credentials — no separate login needed.",
   "type": "module",
   "main": "./dist/index.js",
