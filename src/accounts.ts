@@ -4,7 +4,13 @@
 
 import type { Account, OAuthCredentials, PluginConfig } from "./types.js";
 import { refreshToken } from "./oauth.js";
-import { loadAccounts, saveAccounts, getActiveAccount } from "./storage.js";
+import {
+  loadAccounts,
+  saveAccounts,
+  getActiveAccount,
+  importFromClaudeCode,
+  logToFile,
+} from "./storage.js";
 
 const DEFAULT_CONFIG: PluginConfig = {
   proactiveRefreshThresholdMs: 60 * 60 * 1000, // 1 hour
@@ -89,6 +95,35 @@ export async function refreshIfNeeded(
 
   if (!refreshed) {
     console.error(`[dark-auth] Failed to refresh token for account ${account.id}`);
+
+    // Our stored refresh token may have gone stale relative to Claude Code's
+    // (e.g. the `claude` CLI rotated it independently in another session).
+    // Re-import the current credentials from Claude Code's file and use
+    // those instead of giving up outright.
+    const imported = importFromClaudeCode();
+    if (imported && imported.credentials.expiresAt > now) {
+      console.log(
+        `[dark-auth] Resynced stale credentials from Claude Code for account ${account.id}`
+      );
+      logToFile(
+        `[dark-auth] Resynced stale credentials from Claude Code for account ${account.id}`
+      );
+
+      account.credentials = imported.credentials;
+      account.lastUsedAt = now;
+
+      const storage = loadAccounts();
+      const index = storage.accounts.findIndex((a) => a.id === account.id);
+      if (index >= 0) {
+        storage.accounts[index] = account;
+        saveAccounts(storage);
+      }
+
+      credentialsCache.delete(account.id);
+      return imported.credentials;
+    }
+
+    logToFile(`[dark-auth] Resync from Claude Code unavailable or also stale for account ${account.id}`);
     return null;
   }
 

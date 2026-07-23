@@ -9,6 +9,7 @@ import type { Account } from "./types.js";
 const mocks = vi.hoisted(() => ({
   loadAccountsReturn: null as any,
   refreshTokenReturn: null as any,
+  importFromClaudeCodeReturn: null as any,
 }));
 
 // Mock the disk-backed storage module and the network-backed oauth module
@@ -18,13 +19,15 @@ vi.mock("./storage.js", () => ({
   loadAccounts: vi.fn(() => mocks.loadAccountsReturn),
   saveAccounts: vi.fn(),
   getActiveAccount: vi.fn(),
+  importFromClaudeCode: vi.fn(() => mocks.importFromClaudeCodeReturn),
+  logToFile: vi.fn(),
 }));
 
 vi.mock("./oauth.js", () => ({
   refreshToken: vi.fn(() => Promise.resolve(mocks.refreshTokenReturn)),
 }));
 
-import { loadAccounts, saveAccounts } from "./storage.js";
+import { loadAccounts, saveAccounts, importFromClaudeCode } from "./storage.js";
 import { refreshToken } from "./oauth.js";
 import {
   refreshIfNeeded,
@@ -56,6 +59,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.loadAccountsReturn = null;
   mocks.refreshTokenReturn = null;
+  mocks.importFromClaudeCodeReturn = null;
   invalidateCache();
 });
 
@@ -119,6 +123,57 @@ describe("refreshIfNeeded", () => {
   it("returns null when the underlying OAuth refresh call fails", async () => {
     const account = makeAccount();
     mocks.refreshTokenReturn = null;
+
+    const result = await refreshIfNeeded(account, true);
+
+    expect(result).toBeNull();
+    expect(saveAccounts).not.toHaveBeenCalled();
+  });
+
+  it("resyncs from Claude Code's credentials file when OAuth refresh fails but a fresh import is available", async () => {
+    const account = makeAccount();
+    mocks.refreshTokenReturn = null;
+    mocks.loadAccountsReturn = {
+      version: 1,
+      accounts: [account],
+      activeAccountId: account.id,
+    };
+    const freshCredentials = {
+      accessToken: "resynced-access",
+      refreshToken: "resynced-refresh",
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    };
+    mocks.importFromClaudeCodeReturn = {
+      id: "some-other-id",
+      label: "Claude Code",
+      credentials: freshCredentials,
+      enabled: true,
+      createdAt: Date.now(),
+      lastUsedAt: Date.now(),
+    };
+
+    const result = await refreshIfNeeded(account, true);
+
+    expect(importFromClaudeCode).toHaveBeenCalled();
+    expect(result).toEqual(freshCredentials);
+    expect(saveAccounts).toHaveBeenCalled();
+  });
+
+  it("returns null when the Claude Code fallback import is also expired", async () => {
+    const account = makeAccount();
+    mocks.refreshTokenReturn = null;
+    mocks.importFromClaudeCodeReturn = {
+      id: "some-other-id",
+      label: "Claude Code",
+      credentials: {
+        accessToken: "stale-access",
+        refreshToken: "stale-refresh",
+        expiresAt: Date.now() - 1000,
+      },
+      enabled: true,
+      createdAt: Date.now(),
+      lastUsedAt: Date.now(),
+    };
 
     const result = await refreshIfNeeded(account, true);
 
