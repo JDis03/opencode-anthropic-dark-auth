@@ -1,3 +1,8 @@
+## 2026-11-10 00:27 — opencode-anthropic-dark-auth
+**Summary**: Subí ccVersion a 2.1.321 para que Anthropic acepte claude-fable-5-2 (exigía >=2.1.290). Test actualizado, build hecho; falta reinicio del servicio por el usuario y commit.
+**Verified**: npm test 51 passed; npm run build OK; dist/model-config.js contiene ccVersion 2.1.321; ANTHROPIC_CLI_VERSION no está definida en la shell. Sin request real a fable-5-2.
+**Completed**: none
+---
 ## 2026-11-09 23:23 — opencode-anthropic-dark-auth
 **Summary**: Arreglé la rotación 429: handleRateLimit ahora salta cuentas expiradas (+test). Deshabilité 3 cuentas vencidas en dark-auth-accounts.json (backup .bak-20261109) y cambié la activa a 817251cb (sin rate limit).
 **Verified**: npm test 51 passed (1 nuevo); npm run build OK; verificado el estado del JSON de cuentas por script (3 deshabilitadas, activa 817251cb). Sin requests reales a Anthropic, sin reiniciar el servicio, sin commit.

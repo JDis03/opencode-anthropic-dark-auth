@@ -1,7 +1,7 @@
 // @ts-nocheck
 export const config = {
     // Keep the advertised Claude Code version at the minimum required by current models.
-    ccVersion: "2.1.280",
+    ccVersion: "2.1.321",
     baseBetas: [
         "claude-code-20250219",
         "oauth-2025-04-20",

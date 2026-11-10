@@ -281,8 +281,8 @@ describe("transformBody — sanitizes tool input_schema end-to-end", () => {
       const result = JSON.parse(transformBody(JSON.stringify({ messages: [] })));
       const billingHeader = result.system[0].text;
 
-      expect(config.ccVersion).toBe("2.1.280");
-      expect(billingHeader).toContain("cc_version=2.1.280.");
+      expect(config.ccVersion).toBe("2.1.321");
+      expect(billingHeader).toContain("cc_version=2.1.321.");
     } finally {
       if (previousVersion === undefined) {
         delete process.env.ANTHROPIC_CLI_VERSION;
