@@ -12,6 +12,7 @@ export interface Account {
   id: string;
   label: string;
   credentials: OAuthCredentials;
+  source?: "claude-code"; // Only imported Claude Code accounts may follow its token rotations
   enabled: boolean;
   rateLimitedUntil?: number; // Unix timestamp in milliseconds
   createdAt: number;

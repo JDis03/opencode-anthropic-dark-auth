@@ -116,8 +116,9 @@ export function importFromClaudeCode(): Account | null {
       createdAt: Date.now(),
       lastUsedAt: Date.now(),
     };
-  } catch (err) {
-    logToFile("[import] Failed to parse Claude Code credentials", { error: String(err) });
+  } catch {
+    // JSON parse errors can quote part of the credential file; never log it.
+    logToFile("[import] Failed to parse Claude Code credentials");
     return null;
   }
 }

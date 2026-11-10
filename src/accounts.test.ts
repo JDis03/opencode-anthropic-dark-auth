@@ -43,7 +43,7 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
     credentials: {
       accessToken: "old-access",
       refreshToken: "old-refresh",
-      expiresAt: Date.now() + 60 * 60 * 1000, // 1h from now
+      expiresAt: Date.now() + 2 * 60 * 60 * 1000, // outside the 1h proactive-refresh window
     },
     enabled: true,
     createdAt: Date.now(),
@@ -131,7 +131,7 @@ describe("refreshIfNeeded", () => {
   });
 
   it("resyncs from Claude Code's credentials file when OAuth refresh fails but a fresh import is available", async () => {
-    const account = makeAccount();
+    const account = makeAccount({ source: "claude-code" });
     mocks.refreshTokenReturn = null;
     mocks.loadAccountsReturn = {
       version: 1,
@@ -157,6 +157,21 @@ describe("refreshIfNeeded", () => {
     expect(importFromClaudeCode).toHaveBeenCalled();
     expect(result).toEqual(freshCredentials);
     expect(saveAccounts).toHaveBeenCalled();
+  });
+
+  it("does not overwrite an unrelated account from a different Claude Code login", async () => {
+    const account = makeAccount();
+    mocks.refreshTokenReturn = null;
+    mocks.importFromClaudeCodeReturn = makeAccount({
+      id: "other", credentials: {
+        accessToken: "other-access", refreshToken: "other-refresh",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      },
+    });
+
+    expect(await refreshIfNeeded(account, true)).toBeNull();
+    expect(account.credentials.accessToken).toBe("old-access");
+    expect(saveAccounts).not.toHaveBeenCalled();
   });
 
   it("returns null when the Claude Code fallback import is also expired", async () => {
@@ -259,5 +274,27 @@ describe("handleRateLimit — 429 rotation (regression: was dead-imported and un
     const next = handleRateLimit("acc-1", 60_000);
 
     expect(next).toBeNull();
+  });
+
+  it("skips accounts whose credentials have expired", () => {
+    const rateLimited = makeAccount({ id: "acc-1" });
+    const expired = makeAccount({
+      id: "acc-2",
+      credentials: {
+        accessToken: "exp-access",
+        refreshToken: "exp-refresh",
+        expiresAt: Date.now() - 10_000,
+      },
+    });
+    const valid = makeAccount({ id: "acc-3" });
+    mocks.loadAccountsReturn = {
+      version: 1,
+      accounts: [rateLimited, expired, valid],
+      activeAccountId: "acc-1",
+    };
+
+    const next = handleRateLimit("acc-1", 60_000);
+
+    expect(next?.id).toBe("acc-3");
   });
 });

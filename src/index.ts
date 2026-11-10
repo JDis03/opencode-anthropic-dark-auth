@@ -23,8 +23,8 @@ import {
   importFromAuthJson,
   logToFile,
 } from "./storage.js";
-import { transformBody, transformResponseStream, estimateBodyTokens, debugCompactionState } from "./transforms";
-import { config, TOKEN_THRESHOLDS, getModelCost } from "./model-config";
+import { transformBody, transformResponseStream, estimateBodyTokens, debugCompactionState } from "./transforms.js";
+import { config, TOKEN_THRESHOLDS, getModelCost } from "./model-config.js";
 import {
   getCachedCredentials,
   refreshIfNeeded,

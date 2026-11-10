@@ -4,6 +4,7 @@ import {
   sanitizeInputSchema,
   transformBody,
 } from "./transforms.js";
+import { config } from "./model-config.js";
 
 describe("estimateBodyTokens", () => {
   it("returns 0 for empty/invalid input", () => {
@@ -272,6 +273,25 @@ describe("sanitizeInputSchema — regression: was lossy on property collisions",
 });
 
 describe("transformBody — sanitizes tool input_schema end-to-end", () => {
+  it("advertises a Claude Code version that supports current models", () => {
+    const previousVersion = process.env.ANTHROPIC_CLI_VERSION;
+    delete process.env.ANTHROPIC_CLI_VERSION;
+
+    try {
+      const result = JSON.parse(transformBody(JSON.stringify({ messages: [] })));
+      const billingHeader = result.system[0].text;
+
+      expect(config.ccVersion).toBe("2.1.280");
+      expect(billingHeader).toContain("cc_version=2.1.280.");
+    } finally {
+      if (previousVersion === undefined) {
+        delete process.env.ANTHROPIC_CLI_VERSION;
+      } else {
+        process.env.ANTHROPIC_CLI_VERSION = previousVersion;
+      }
+    }
+  });
+
   it("rewrites a root-level oneOf on a tool's input_schema so the request would not 400", () => {
     const body = JSON.stringify({
       messages: [],

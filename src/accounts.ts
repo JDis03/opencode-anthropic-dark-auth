@@ -101,7 +101,16 @@ export async function refreshIfNeeded(
     // Re-import the current credentials from Claude Code's file and use
     // those instead of giving up outright.
     const imported = importFromClaudeCode();
-    if (imported && imported.credentials.expiresAt > now) {
+    // An unrelated Claude Code login must not replace this account on a 401.
+    // Marked imports can follow token rotation; legacy imports need a match.
+    const matches = imported && (
+      (imported.credentials.accessToken !== "" &&
+        imported.credentials.accessToken === account.credentials.accessToken) ||
+      (imported.credentials.refreshToken !== "" &&
+        imported.credentials.refreshToken === account.credentials.refreshToken)
+    );
+    if (imported && imported.credentials.expiresAt > now &&
+      (account.source === "claude-code" || matches)) {
       console.log(
         `[dark-auth] Resynced stale credentials from Claude Code for account ${account.id}`
       );
@@ -110,6 +119,7 @@ export async function refreshIfNeeded(
       );
 
       account.credentials = imported.credentials;
+      account.source = "claude-code";
       account.lastUsedAt = now;
 
       const storage = loadAccounts();
@@ -171,11 +181,12 @@ export function handleRateLimit(
     account.rateLimitedUntil = Date.now() + retryAfterMs;
   }
 
-  // Find next available account (enabled, not rate limited)
+  // Find next available account (enabled, not rate limited, unexpired)
   const available = storage.accounts.filter(
     (a) =>
       a.id !== accountId &&
       a.enabled &&
+      a.credentials.expiresAt > Date.now() &&
       (!a.rateLimitedUntil || a.rateLimitedUntil < Date.now())
   );
 

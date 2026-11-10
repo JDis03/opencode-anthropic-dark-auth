@@ -256,6 +256,9 @@ export function sanitizeInputSchema(schema) {
  * lowercase names (mcp_bash, mcp_read) are flagged as non-Claude-Code clients.
  */
 function prefixName(name) {
+    // HTTP hooks can run again on a retried request whose body is already
+    // transformed. Do not accumulate mcp_ prefixes on tools/history.
+    if (name.startsWith(TOOL_PREFIX)) return name;
     return `${TOOL_PREFIX}${name.charAt(0).toUpperCase()}${name.slice(1)}`;
 }
 /**
@@ -366,6 +369,12 @@ export function transformBody(body) {
             }
         }
         parsed.system = splitSystem;
+        // V2 has no V1 system.transform hook to prepend this identity. Keep
+        // exactly one dedicated entry whether the caller already supplied it
+        // (possibly concatenated with other instructions) or not.
+        if (!parsed.system.some((entry) => entry?.type === "text" && entry.text === SYSTEM_IDENTITY)) {
+            parsed.system.splice(1, 0, { type: "text", text: SYSTEM_IDENTITY });
+        }
         // --- Relocate non-core system entries to user messages ---
         // Anthropic's API now validates the system prompt for OAuth-authenticated
         // requests that use Claude Code billing.  Third-party system prompts
